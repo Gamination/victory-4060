@@ -34,8 +34,16 @@ use super::host::{GraphicsState, HostPipeline};
 const SHADERS: &str = "known-shaders.bin";
 const PIPELINES: &str = "known-pipelines.bin";
 /// Stages by their number in the files.
-const STAGES: [&str; 8] =
-    ["vertex", "pixel", "domain", "hull", "geometry", "compute", "amplification", "mesh"];
+const STAGES: [&str; 8] = [
+    "vertex",
+    "pixel",
+    "domain",
+    "hull",
+    "geometry",
+    "compute",
+    "amplification",
+    "mesh",
+];
 
 /// `VICTORY_PIPELINE_BOOK=1`: the pipelines the title creates are kept.
 fn on() -> bool {
@@ -74,15 +82,27 @@ fn book() -> Option<&'static Mutex<Book>> {
                 let _ = f.set_len(end);
             }
         }
-        tracing::info!(pipelines = keys.len(), shaders = shaders.len(), "title pipelines known from earlier runs");
-        let spawned = std::thread::Builder::new().name("victory-known".into()).spawn(|| {
-            loop {
-                std::thread::sleep(std::time::Duration::from_secs(2));
-                flush();
-            }
-        });
+        tracing::info!(
+            pipelines = keys.len(),
+            shaders = shaders.len(),
+            "title pipelines known from earlier runs"
+        );
+        let spawned = std::thread::Builder::new()
+            .name("victory-known".into())
+            .spawn(|| {
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    flush();
+                }
+            });
         spawned.ok()?;
-        Some(Mutex::new(Book { dir, keys, shaders, new: Default::default(), added: 0 }))
+        Some(Mutex::new(Book {
+            dir,
+            keys,
+            shaders,
+            new: Default::default(),
+            added: 0,
+        }))
     })
     .as_ref()
 }
@@ -92,7 +112,10 @@ pub(super) fn note(key: &str, shaders: &[Arc<Shader>], graphics: Option<&Graphic
     let Some(book) = book() else { return };
     let mut id = [0u8; 16];
     for (at, b) in id.iter_mut().enumerate() {
-        *b = key.get(2 * at..2 * at + 2).and_then(|x| u8::from_str_radix(x, 16).ok()).unwrap_or(0);
+        *b = key
+            .get(2 * at..2 * at + 2)
+            .and_then(|x| u8::from_str_radix(x, 16).ok())
+            .unwrap_or(0);
     }
     let mut book = book.lock().unwrap_or_else(|e| e.into_inner());
     if shaders.is_empty() || !book.keys.insert(id) {
@@ -130,7 +153,11 @@ fn flush() {
         if book.added == 0 {
             return;
         }
-        (book.dir.clone(), std::mem::take(&mut book.new), std::mem::take(&mut book.added))
+        (
+            book.dir.clone(),
+            std::mem::take(&mut book.new),
+            std::mem::take(&mut book.added),
+        )
     };
     for (file, bytes) in [SHADERS, PIPELINES].iter().zip(&new) {
         let written = std::fs::OpenOptions::new()
@@ -149,7 +176,9 @@ fn flush() {
 /// Calls `f` with each container's stage, hash, place and length; where the
 /// last whole one ends.
 fn walk_shaders(dir: &Path, mut f: impl FnMut(u8, [u8; 32], u64, u32)) -> u64 {
-    let Ok(file) = std::fs::File::open(dir.join(SHADERS)) else { return 0 };
+    let Ok(file) = std::fs::File::open(dir.join(SHADERS)) else {
+        return 0;
+    };
     let len = file.metadata().map_or(0, |m| m.len());
     let mut file = std::io::BufReader::new(file);
     let mut at = 0;
@@ -174,7 +203,9 @@ fn walk_pipelines(dir: &Path, mut f: impl FnMut(usize, &[u8])) -> u64 {
     let (mut at, mut n) = (0, 0);
     while let Some(head) = bytes.get(at..at + 4) {
         let size = u32::from_le_bytes([head[0], head[1], head[2], head[3]]) as usize;
-        let Some(entry) = bytes.get(at + 4..at + 4 + size) else { break };
+        let Some(entry) = bytes.get(at + 4..at + 4 + size) else {
+            break;
+        };
         f(n, entry);
         (at, n) = (at + 4 + size, n + 1);
     }
@@ -188,11 +219,68 @@ pub fn count(dir: &Path) -> usize {
     n
 }
 
+/// The shaders earlier runs recorded in `dir` (runs with
+/// `VICTORY_PIPELINE_BOOK=1`), read at their places from any thread: every
+/// one a pipeline names, which a scan of the title's files need not find
+/// (they may sit in archives `sources` cannot open).
+pub struct Recorded {
+    file: std::fs::File,
+    /// Stage, hash, place and length of each (`walk_shaders`).
+    places: Vec<(u8, [u8; 32], u64, u32)>,
+}
+
+impl Recorded {
+    /// Those of `dir`; `None` when no run has recorded any.
+    pub fn open(dir: &Path) -> Option<Self> {
+        let file = std::fs::File::open(dir.join(SHADERS)).ok()?;
+        let mut places = Vec::new();
+        walk_shaders(dir, |stage, hash, at, len| {
+            places.push((stage, hash, at, len))
+        });
+        (!places.is_empty()).then_some(Recorded { file, places })
+    }
+
+    /// How many there are.
+    pub fn len(&self) -> usize {
+        self.places.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.places.is_empty()
+    }
+
+    /// One of them: its stage, hash and container.
+    pub fn read(&self, n: usize) -> Option<(u8, [u8; 32], Vec<u8>)> {
+        use std::os::windows::fs::FileExt;
+        let &(stage, hash, at, len) = self.places.get(n)?;
+        let mut bytes = vec![0; len as usize];
+        let mut read = 0;
+        while read < bytes.len() {
+            // (`seek_read` reads some, not all: it goes on where it stopped.)
+            let n = self
+                .file
+                .seek_read(&mut bytes[read..], at + read as u64)
+                .ok()?;
+            if n == 0 {
+                return None;
+            }
+            read += n;
+        }
+        Some((stage, hash, bytes))
+    }
+}
+
 /// The key of each pipeline known in `dir`, as the early list has it.
 pub fn keys(dir: &Path) -> Vec<String> {
     let mut all = Vec::new();
     walk_pipelines(dir, |_, e| {
-        all.push(e.get(..16).unwrap_or_default().iter().map(|b| format!("{b:02x}")).collect());
+        all.push(
+            e.get(..16)
+                .unwrap_or_default()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect(),
+        );
     });
     all
 }
@@ -220,8 +308,12 @@ pub fn use_translations(dir: PathBuf) {
 /// there is one.
 pub fn make(dir: &Path, which: &[usize], mut each: impl FnMut(usize, Option<(f64, bool)>)) {
     let mut places = HashMap::new();
-    walk_shaders(dir, |stage, hash, at, len| drop(places.insert(hash, (stage, at, len))));
-    let Ok(mut file) = std::fs::File::open(dir.join(SHADERS)) else { return };
+    walk_shaders(dir, |stage, hash, at, len| {
+        drop(places.insert(hash, (stage, at, len)))
+    });
+    let Ok(mut file) = std::fs::File::open(dir.join(SHADERS)) else {
+        return;
+    };
     let wanted: HashSet<usize> = which.iter().copied().collect();
     let mut entries = HashMap::new();
     walk_pipelines(dir, |n, bytes| {
@@ -237,7 +329,9 @@ pub fn make(dir: &Path, which: &[usize], mut each: impl FnMut(usize, Option<(f64
         Some(bytes)
     };
     for n in which {
-        let Some(entry) = entries.get(n) else { continue };
+        let Some(entry) = entries.get(n) else {
+            continue;
+        };
         each(*n, None);
         let began = std::time::Instant::now();
         let made = parse(entry, &mut read)
@@ -261,7 +355,10 @@ fn parse(
         rest = after;
         let mut hash = [0; 32];
         hash.copy_from_slice(&head[1..]);
-        shaders.push(super::shader(STAGES.get(usize::from(head[0]))?, &read(&hash)?));
+        shaders.push(super::shader(
+            STAGES.get(usize::from(head[0]))?,
+            &read(&hash)?,
+        ));
     }
     let (&graphics, rest) = rest.split_first()?;
     let g = match graphics {
@@ -327,7 +424,10 @@ impl GraphicsState {
     /// The state as bytes.
     fn put(&self, out: &mut Vec<u8>) {
         out.push(u8::from(self.depth_bounds));
-        for f in [self.rasterizer.DepthBiasClamp, self.rasterizer.SlopeScaledDepthBias] {
+        for f in [
+            self.rasterizer.DepthBiasClamp,
+            self.rasterizer.SlopeScaledDepthBias,
+        ] {
             out.extend(f.to_le_bytes());
         }
         let mut plain = GraphicsState {
@@ -421,7 +521,11 @@ mod tests {
 
     #[test]
     fn a_state_comes_back_as_it_was() {
-        let mut g = GraphicsState { sample_mask: 7, depth_bounds: true, ..Default::default() };
+        let mut g = GraphicsState {
+            sample_mask: 7,
+            depth_bounds: true,
+            ..Default::default()
+        };
         g.rasterizer.DepthBias = -3;
         g.rasterizer.SlopeScaledDepthBias = 1.25;
         g.blend.RenderTarget[3].RenderTargetWriteMask = 5;
@@ -429,7 +533,10 @@ mod tests {
         g.targets.NumRenderTargets = 2;
         g.targets.RTFormats[1] = DXGI_FORMAT_R8_UNORM;
         g.depth_format = DXGI_FORMAT_D32_FLOAT;
-        g.names = vec![CString::new("POSITION").unwrap(), CString::new("T").unwrap()];
+        g.names = vec![
+            CString::new("POSITION").unwrap(),
+            CString::new("T").unwrap(),
+        ];
         g.inputs = g
             .names
             .iter()
@@ -473,8 +580,39 @@ mod tests {
         shader.extend_from_slice(&shader.clone()[..20]);
         std::fs::write(dir.join(SHADERS), &shader).unwrap();
         let mut seen = Vec::new();
-        assert_eq!(walk_shaders(&dir, |stage, hash, at, len| seen.push((stage, hash[0], at, len))), one);
+        assert_eq!(
+            walk_shaders(&dir, |stage, hash, at, len| seen
+                .push((stage, hash[0], at, len))),
+            one
+        );
         assert_eq!(seen, [(5, 9, 37, 4)]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recorded_shaders_are_read_at_their_places() {
+        let dir = std::env::temp_dir().join(format!("victory-recorded-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut bytes = Vec::new();
+        for (stage, body) in [(3u8, [1u8, 2, 3].as_slice()), (5, [7, 8].as_slice())] {
+            bytes.push(stage);
+            bytes.extend([stage; 32]);
+            bytes.extend((body.len() as u32).to_le_bytes());
+            bytes.extend(body);
+        }
+        // (A torn one at the end is not one.)
+        bytes.extend([9; 5]);
+        std::fs::write(dir.join(SHADERS), &bytes).unwrap();
+        let recorded = Recorded::open(&dir).expect("two are whole");
+        assert_eq!(recorded.len(), 2);
+        assert!(!recorded.is_empty());
+        let (stage, hash, body) = recorded.read(1).expect("the second");
+        assert_eq!(stage, 5);
+        assert_eq!(hash, [5; 32]);
+        assert_eq!(body, vec![7, 8]);
+        assert!(recorded.read(2).is_none());
+        assert!(recorded.read(0).is_some_and(|(stage, ..)| stage == 3));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(Recorded::open(&dir).is_none());
     }
 }

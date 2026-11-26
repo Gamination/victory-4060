@@ -87,8 +87,13 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
     // LOCAL (victory-perf, via our wt5): opt-in title patches, each checked against the 1.0.2.1 hash and its bytes.
     if std::env::var_os(crate::hooks::NO_WATCHDOG_ENV).is_some() {
         // SAFETY: just mapped, and no title code has run.
-        let applied = unsafe { crate::hooks::disarm_watchdog(loaded.base(), &prepared.original_hash) };
-        tracing::info!(applied, "title watchdog hooks ({})", crate::hooks::NO_WATCHDOG_ENV);
+        let applied =
+            unsafe { crate::hooks::disarm_watchdog(loaded.base(), &prepared.original_hash) };
+        tracing::info!(
+            applied,
+            "title watchdog hooks ({})",
+            crate::hooks::NO_WATCHDOG_ENV
+        );
     }
     // SAFETY: just mapped, and no title code has run.
     let levers = unsafe { crate::hooks::resolution_levers(loaded.base(), &prepared.original_hash) };

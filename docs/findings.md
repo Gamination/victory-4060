@@ -88,7 +88,9 @@ in that order of size:
    after fxceless c36971b2; not measured here yet), and the passes that run for nothing
    without rays.
 3. Stalls: 270-660 s of a session were full of frames over 200 ms, almost all while new
-   pipelines were made. `victory warm`, and a quarter of the workers for the slow ones.
+   pipelines were made. `victory precompile` (what a launch does now, `victory warm`
+   behind it) translates their shaders and makes them before a run instead; a quarter of
+   the workers for the slow ones.
 4. Outdoor flicker: suspected to be one bad indirect record that uses up its list's
    budget, so that every later draw of it is empty. The log's frame line counts them;
    `VICTORY_INDIRECT_REST=0` is the experiment.

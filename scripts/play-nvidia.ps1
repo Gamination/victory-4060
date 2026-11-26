@@ -12,6 +12,17 @@
 #                  (-Adapter '#1'). Default: Windows' default card (the one the main display is on).
 # -Build           target\diag (the default, the build all measurements are of) or target\release
 #                  (the release build ignores the ray-tracing skip list: VICTORY_SKIP_PIPELINES is a diagnostics switch)
+#                  A launch translates every shader of the title and makes the host pipelines earlier runs drew
+#                  with before starting it, and puts back what -SaveShaders wrote: the first time a place is
+#                  seen is then not slow while they are made. It goes on where it stopped, so only what is new
+#                  is done; the first run only records the pipelines (VICTORY_PIPELINE_BOOK, on by default).
+# -Precompile      walk the title even if nothing changed since the last precompile (a launch walks
+#                  it only when the build, the settings, a file of the title or the cache changed).
+# -NoPrecompile    start it without precompiling at all (the quick launch, when the caches are made).
+# -SaveShaders     after precompiling, write every translated shader into one file, so that a wiped cache (or a
+#                  second machine with the same build and settings) need not translate them again.
+# -LoadShaders     kept for older commands too: a launch puts the saved file back when it is there.
+# -ShadersFile     the file -SaveShaders writes and a launch loads. Default: precompiled.vpc, beside the cache.
 # -More            other settings: -More @{VICTORY_PANEL='1'}
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
 param(
@@ -23,6 +34,11 @@ param(
     [ValidateSet('2160', '1440', '1080', '720', '540', '480')][string]$Resolution,
     [string]$Adapter,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
+    [switch]$Precompile,
+    [switch]$NoPrecompile,
+    [switch]$SaveShaders,
+    [switch]$LoadShaders,
+    [string]$ShadersFile,
     [hashtable]$More = @{}
 )
 $settings = @{
@@ -43,6 +59,10 @@ $settings = @{
     # waited for at most once (VICTORY_PIPELINE_WAIT_ONCE, on by default): one that takes longer no longer stops the
     # picture in every frame it is in view (pipeline/make.rs).
     VICTORY_PIPELINE_WAIT_MS = '10000'
+    # The pipelines a run creates are written down (in the cache folder: they hold the title's own shaders): that is
+    # what -Precompile makes ahead of the runs after it (pipeline/known.rs). Off would leave a first precompile with
+    # nothing to make.
+    VICTORY_PIPELINE_BOOK = '1'
     # NVIDIA caps the shader-visible view heap at 1,000,000: without more dynamic slots thousands of draws a frame
     # are dropped (descriptor/host.rs dynamic_slots).
     VICTORY_DYNAMIC_SLOTS = '524288'
@@ -97,11 +117,37 @@ if (-not $NoSmoothMotion) {
     $victory = $sm
 }
 # (Other settings left over in this window go; where your files are stays.)
-$paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR'
+$paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR', 'VICTORY_LOW_RAM',
+    'VICTORY_ARENA_MB', 'VICTORY_MAX_PAGES', 'VICTORY_FAULTS_PER_FRAME', 'VICTORY_FAULTS_ALL', 'VICTORY_UPLOAD_ARENA_MB', 'VICTORY_TEXTURE_SPARE_KEPT', 'VICTORY_STAGING_KEPT', 'VICTORY_RIPE_BLOCKS', 'VICTORY_CARD_BUFFERS_MIN_KB', 'VICTORY_CARD_BUFFERS_MB'
 Get-ChildItem Env:VICTORY_* | Where-Object { $_.Name -notin $paths } | ForEach-Object { Remove-Item "Env:$($_.Name)" }
 foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
 $Exe = (Resolve-Path $Exe).Path
 $runArgs = @('run', $Exe, '--execute')
 if (-not $SeriesX) { $runArgs += @('--console', 'series-s') }
 Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
-try { & $victory @runArgs } finally { Pop-Location }
+try {
+    # What every launch does first (the default): everything a run would translate and make, with these settings
+    # (a translation depends on them), into the shader cache and the driver's own cache, which the run then reads
+    # instead, and the shaders a -SaveShaders run wrote, put back first. -NoPrecompile is the quick launch.
+    $restore = (-not $NoPrecompile) -or $LoadShaders
+    if ($restore -or $SaveShaders) {
+        Write-Host 'Precompiling the title''s shaders and pipelines (the cache makes the next times quicker; -NoPrecompile skips this)...'
+        $preArgs = @((Split-Path $Exe))
+        if ($restore) {
+            if ($ShadersFile) {
+                # Only there after a -SaveShaders run: the first launch has none.
+                if (Test-Path $ShadersFile) { $preArgs += "--load=$ShadersFile" }
+                else { Write-Host "No $ShadersFile yet: nothing to load." }
+            } else { $preArgs += '--load' }
+            # A launch walks the title only when the last precompile saw something else (its files,
+            # the build, the settings, the cache); -Precompile walks it always.
+            if (-not $Precompile) { $preArgs += '--if-needed' }
+        }
+        if ($SaveShaders) {
+            if ($ShadersFile) { $preArgs += "--save=$ShadersFile" } else { $preArgs += '--save' }
+        }
+        & $victory precompile @preArgs
+        if ($LASTEXITCODE -ne 0) { Write-Host "Precompile ended with exit code $LASTEXITCODE."; return }
+    }
+    & $victory @runArgs
+} finally { Pop-Location }

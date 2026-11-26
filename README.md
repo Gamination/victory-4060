@@ -133,7 +133,10 @@ RTX 5070 12 GB with a Ryzen 7 9800X3D, in the prologue:
    10 ms a frame, and the frame rate doubled (11 to 21.8 fps).
 6. **Wait for new shaders** (`VICTORY_PIPELINE_WAIT_MS=10000`). Draws wait for
    a pipeline still being made instead of being skipped: nothing is missing,
-   with a short hitch the first time a place is seen.
+   with a short hitch the first time a place is seen. A launch precompiles
+   first (see
+   [Precompiling shaders and pipelines](#precompiling-shaders-and-pipelines)),
+   which moves that hitch before the run.
 7. **NVIDIA Smooth Motion** (by default in `play-nvidia.ps1`). The script
    starts a copy of the build named `victory_sm.exe`; with Smooth Motion turned
    on for that exe in the NVIDIA App, the driver inserts a generated frame
@@ -274,6 +277,21 @@ VRAM while at least 20% of the reported local budget remains free. The fallback
 uses system-RAM upload buffers. To compare the two paths on the same scene,
 pass `-More @{VICTORY_TEXTURE_BAR='0'}` to `scripts/play-nvidia.ps1`.
 
+#### Low-RAM optimizations (16GB and under)
+
+On systems with 16GB or less physical RAM, Victory automatically enables
+memory optimizations to reduce pressure:
+
+- **Reduced arena size**: Title memory arenas use 32 MiB instead of 64 MiB
+- **Reduced max pages**: Up to 1 GiB of title memory pages instead of 3 GiB
+- Low-RAM mode retains at most one empty staging block. Below 2 GiB of available RAM it releases every eligible empty block.
+- **Reduced faults**: 64 page faults per frame instead of 128
+- **Reduced card buffers**: Capped at 256 MiB VRAM for title buffer copies
+- **Reduced ripe blocks**: Maximum 6 texture blocks made ahead instead of 12
+
+To manually enable or disable low-RAM mode, set the environment variable
+`VICTORY_LOW_RAM=1` or `VICTORY_LOW_RAM=0`.
+
 The periodic sweep can release empty staging blocks after their submissions
 finish. It keeps up to 128 MiB of empty staging blocks and drops that allowance
 to zero below 2 GiB of available physical RAM. Live textures, buffers, and
@@ -286,8 +304,7 @@ model 6.6 and mesh shaders, Rust (the toolchain is pinned), the MSVC build
 tools, and your own dump of the title.
 
 ```powershell
-git clone --branch work https://github.com/Gamination/victory-4060.git
-cd victory-4060
+# Open PowerShell in the extracted combined source folder.
 copy victory.example.toml victory.toml      # then set your paths, outside this folder
 cargo build --locked --profile diag -p victory --features diagnostics
 scripts\play-nvidia.ps1 -Exe <path of your copy's executable>
@@ -297,8 +314,10 @@ scripts\play-nvidia.ps1 -Exe <path of your copy's executable>
 NVIDIA Smooth Motion applies every time once it is turned on for that exe in the
 NVIDIA App. `-NoSmoothMotion` runs `victory.exe` itself; `-SeriesX` uses the
 Series X profile (sharper, much slower); `-Quality` gives fewer stretched bodies
-and less rainbow skin for about 7 fps. The fork's own `scripts\play.ps1` is
-still there for AMD cards.
+and less rainbow skin for about 7 fps; `-NoPrecompile` starts the title at once
+instead of translating its shaders and making its pipelines first (see
+[Precompiling shaders and pipelines](#precompiling-shaders-and-pipelines)). The
+fork's own `scripts\play.ps1` is still there for AMD cards.
 
 For AMD, launch the same build with the existing AMD settings:
 
@@ -320,6 +339,65 @@ scripts\play.ps1 -Exe <path of your copy's executable> -More @{VICTORY_TEXTURE_B
 
 The AMD launcher uses its own profile and settings. The resolution wrappers
 below call the NVIDIA launcher and apply its settings.
+
+### Precompiling shaders and pipelines
+
+The first time a place is seen, its shaders are translated and its host
+pipelines compiled, and the picture waits while that happens. A launch does
+that work before the title starts, when it has anything to do:
+
+```powershell
+scripts\play-nvidia.ps1 -Exe <path of your copy's executable>
+```
+
+That is `victory precompile --if-needed` run with the launcher's own settings,
+then the title as usual. It translates every shader found in the title's files
+and every shader earlier runs recorded into the shader cache, then makes the
+host pipelines those runs drew with, so the driver's cache on disk has them.
+It goes on where it stopped: both caches keep what was made, so only what is
+new is done. Reading the title's files to find its shaders takes a minute on a
+large install, so that is done only when the last precompile saw something
+else: another build, other switches, a file of the title that changed or
+appeared, a cache that lost entries. Otherwise the launch goes straight to the
+pipelines, which are warmed every time (it skips what it has made).
+`-Precompile` walks the title regardless; `-NoPrecompile` (or `run.bat skip`)
+starts the title at once; `scripts\play.ps1` does the same for AMD cards, and
+`victory precompile --shaders-only` does the shaders alone.
+
+Two things to know:
+
+- A translation depends on the switches a run uses (`VICTORY_NAN_SCRUB`,
+  `VICTORY_BVH_MISS` and the other shader switches are part of its cache key),
+  so precompile with the launcher: a cache made with other settings is not used
+  by the run.
+- Pipelines are known from earlier runs, and the launchers record them by
+  default (`VICTORY_PIPELINE_BOOK=1`, the title's own shaders in the cache
+  folder). So the first launch has no pipelines to make and says so; the
+  second makes them.
+
+The translations are on disk from the moment they are made, in
+`<cache folder>\shaders` (the report names the cache folder). To keep them as
+one file — for a cache that is wiped, or a second machine with the same build
+and settings — `--save` writes every one of them and `--load` puts them back:
+
+```powershell
+victory precompile --save=<file>   # --save alone uses precompiled.vpc, beside the cache folder
+victory precompile --load=<file>   # --load alone reads it
+```
+
+The launchers take `-SaveShaders` (and `-ShadersFile <path>`) and put the saved
+file back at the start of every launch; `run.bat save` / `run.bat load` use the
+default file. What is written holds the title's shaders, translated, and is
+about the size of the cache folder (a few GB for this title): like the cache, it
+stays outside the repository and is not shared.
+
+Every launch does it, so a change of the build, of the launcher's settings, of
+a file of the title or of the graphics driver is picked up by the next one: it
+walks the title when there is anything new to find there, and makes the
+pipelines whose own key changed. `-NoPrecompile` skips the whole step. Making
+the 2,000-odd pipelines earlier runs drew with is the part that removes the
+hitch when a place is first seen; `--all` also makes the tens of thousands the
+title creates while it loads and never draws with, which takes much longer.
 
 ### Picking a resolution
 
