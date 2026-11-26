@@ -1,12 +1,51 @@
-# VIctory on NVIDIA
+# VIctory for NVIDIA and AMD
+
+This fork adds dedicated GPU memory fixes to VIctory for NVIDIA and AMD.
+The memory changes were checked on an AMD Radeon RX 7600, including texture
+uploads and GPU readback, and on Windows' software renderer. Gameplay FPS and
+total RAM or VRAM savings from these changes still need measurement.
+
+The NVIDIA gameplay results below come from the earlier fork's reported runs.
+They predate these memory changes. NVIDIA Smooth Motion applies to the NVIDIA
+launcher; AMD users can use the existing AMD launcher.
+
+## Dedicated GPU memory changes
+
+- Page-aligned graphics allocations use demand-zero, write-watched system
+  memory at console-addressable addresses. Creating a 16 MiB allocation in
+  the allocation test touched zero pages.
+- Sampled textures retain CPU-writable console storage and a GPU-local host
+  texture. CPU writes are detiled into upload buffers and copied with
+  Direct3D 12 texture copies and resource transitions.
+- On supported discrete adapters, up to two 64 MiB texture staging blocks can
+  use GPU upload heaps while at least 20% of the reported local VRAM budget
+  remains free. System-RAM upload buffers handle the fallback.
+- CPU-visible buffer heaps use one mapped host mirror unless the explicit
+  two-sided synchronization override is enabled.
+- The periodic sweep releases returned staging blocks after their submissions
+  finish and the reuse delay passes. Empty staging retention is capped at
+  128 MiB and falls to zero below 2 GiB of available physical RAM.
+- Persistent CPU mappings of supported sampled DEFAULT textures are refreshed
+  for the next submission. Pending lists retain separate staging storage
+  when needed.
+
+These changes adapt console memory behavior to separate PC memory pools.
+The title still receives the stable CPU addresses it expects. Live resources,
+pending work, and the title's own allocations can exceed the cache limits.
+
+Validation covered 42 targeted tests across resources, allocation translation,
+physical page aliases, staging reclamation, texture detiling, and GPU readback.
+Three successive writes through one persistent texture mapping were read back
+correctly, including writes made after command recording. Mixed CPU/GPU writes
+to the same texture and unsupported Xbox swizzle modes remain limitations.
+RTX 4060 gameplay performance has yet to be measured.
 
 ## Built from many projects
 
-This repository did not come from one place. Over several weeks we built, ran
-and measured the work of many projects on the same NVIDIA machine, kept what
-worked on this card, and brought the best of each together here. No single one
-of them runs this well on NVIDIA by itself; the combination is what gets it to
-where it is now.
+This repository builds on work from several VIctory projects. The NVIDIA
+fork's authors combined and measured those projects on their NVIDIA machine.
+Their credits, reported performance, and explanations are retained below.
+This fork adds the dedicated GPU memory changes described above.
 
 Code that is in this repository:
 
@@ -187,18 +226,21 @@ Also in, off by default:
 A fork of [avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX),
 itself a fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility
 layer that runs an Xbox Series title natively on Windows from files the user
-supplies. That fork is tuned for an AMD RX 7900 XTX. This one makes it **draw
-everything on NVIDIA cards and run fastest there**, using the Series S profile.
+supplies. That fork is tuned for an AMD RX 7900 XTX. The NVIDIA fork adds its Series S
+settings and NVIDIA fixes. This fork carries those changes and adds memory
+handling improvements shared by NVIDIA and AMD adapters.
 
 **This repository contains no game files, code or assets.** You need your own
 copy of the game. It is not affiliated with or endorsed by the game's developer
 or publisher.
 
-## Where it stands (2026-11-25)
+## Earlier NVIDIA gameplay results (2026-11-25)
 
-Tested on one machine only: Windows 11, AMD Ryzen 7 9800X3D, 64 GB RAM,
-GeForce RTX 5070 12 GB, the Series S profile at half render scale
-(`scripts\play-nvidia.ps1`).
+The earlier NVIDIA fork reported gameplay measurements on Windows 11,
+AMD Ryzen 7 9800X3D, 64 GB RAM, and GeForce RTX 5070 12 GB, using the Series S
+profile at half render scale (`scripts\play-nvidia.ps1`).
+The RX 7600 memory validation described above covers targeted tests.
+An AMD gameplay benchmark for these memory changes is pending.
 
 | | |
 |---|---|
@@ -244,8 +286,8 @@ model 6.6 and mesh shaders, Rust (the toolchain is pinned), the MSVC build
 tools, and your own dump of the title.
 
 ```powershell
-git clone https://github.com/trustno1-coder/VIctory-NVIDIA
-cd VIctory-NVIDIA
+git clone --branch work https://github.com/Gamination/victory-4060.git
+cd victory-4060
 copy victory.example.toml victory.toml      # then set your paths, outside this folder
 cargo build --locked --profile diag -p victory --features diagnostics
 scripts\play-nvidia.ps1 -Exe <path of your copy's executable>
@@ -257,6 +299,27 @@ NVIDIA App. `-NoSmoothMotion` runs `victory.exe` itself; `-SeriesX` uses the
 Series X profile (sharper, much slower); `-Quality` gives fewer stretched bodies
 and less rainbow skin for about 7 fps. The fork's own `scripts\play.ps1` is
 still there for AMD cards.
+
+For AMD, launch the same build with the existing AMD settings:
+
+```powershell
+scripts\play.ps1 -Exe <path of your copy's executable>
+```
+
+To select an AMD adapter on a PC with multiple GPUs:
+
+```powershell
+scripts\play.ps1 -Exe <path of your copy's executable> -More @{VICTORY_ADAPTER='RX 7600'}
+```
+
+To compare system-RAM texture staging on AMD:
+
+```powershell
+scripts\play.ps1 -Exe <path of your copy's executable> -More @{VICTORY_TEXTURE_BAR='0'}
+```
+
+The AMD launcher uses its own profile and settings. The resolution wrappers
+below call the NVIDIA launcher and apply its settings.
 
 ### Picking a resolution
 
@@ -379,7 +442,10 @@ commits taken from elsewhere name the commit and its author.
 - **Geckomacabre** and **cxy0072019-sketch**: the texture read-back.
 - **[XCL](https://github.com/xcl-dev/xcl)** (GPL-2.0-only) was read for how the same
   title behaves under another layer; no code of it is here.
-- This fork's changes were made with [Claude Code](https://claude.com/claude-code).
+- The earlier NVIDIA fork's changes were made with
+  [Claude Code](https://claude.com/claude-code).
+- This fork's dedicated GPU memory changes were developed and tested with
+  OpenAI Codex.
 
 ## License
 
