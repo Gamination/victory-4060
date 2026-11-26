@@ -1524,11 +1524,29 @@ pub(crate) fn room_lately() -> bool {
 fn room_percent() -> u64 {
     static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *PERCENT.get_or_init(|| {
-        std::env::var("VICTORY_TEXTURE_ROOM_PERCENT")
+        if let Some(percent) = std::env::var("VICTORY_TEXTURE_ROOM_PERCENT")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(90, |percent| percent.clamp(50, 97))
+        {
+            return percent.clamp(50, 97);
+        }
+        // Pascal-class cards such as the GTX 1070 commonly expose about
+        // 8 GiB of VRAM. Leaving the old fixed 10% reserve there starves
+        // the bindless texture queue even though the title's render
+        // targets and buffers still fit. Keep a smaller, but bounded,
+        // reserve on <=8 GiB adapters; larger cards keep the long-tested
+        // 90% policy.
+        let budget = crate::host::host()
+            .and_then(|h| h.video_memory())
+            .map(|[budget, ..]| budget);
+        default_texture_room_percent(budget)
     })
+}
+
+fn default_texture_room_percent(budget: Option<u64>) -> u64 {
+    budget
+        .filter(|&bytes| bytes != 0 && bytes <= 8 * (1024u64 << 30))
+        .map_or(90, |_| 94)
 }
 
 /// For the card accounting line ([`card_accounting`]): the title texture
@@ -4134,4 +4152,11 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(slot::<Release>(heap, 0x10)(heap), 1);
         assert_eq!(slot::<Release>(placed, 0x10)(placed), 0);
     }
+    #[test]
+    fn low_vram_texture_room_default_is_higher() {
+        assert_eq!(super::default_texture_room_percent(Some(8 * (1024u64 << 30))), 94);
+        assert_eq!(super::default_texture_room_percent(Some(12 * (1024u64 << 30))), 90);
+        assert_eq!(super::default_texture_room_percent(None), 90);
+    }
+
 }
