@@ -24,6 +24,67 @@ pub struct Config {
     pub test_titles: Vec<PathBuf>,
     /// The config file that was read, if any.
     pub source: Option<PathBuf>,
+    /// Memory configuration settings.
+    pub memory: MemoryConfig,
+}
+
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryConfig {
+    /// Enable low-RAM optimizations for systems with 16GB or less RAM.
+    /// If not set, auto-detects based on physical RAM.
+    pub low_ram: Option<bool>,
+    /// Arena size in MiB for title memory outside buffers.
+    pub arena_mb: Option<u64>,
+    /// Maximum pages of title memory to keep (in 64 KiB pages).
+    pub max_pages: Option<usize>,
+    /// Maximum page faults to handle per frame.
+    pub faults_per_frame: Option<usize>,
+    /// Maximum total page faults to handle across all frames.
+    pub faults_all: Option<usize>,
+    /// Upload arena size in MiB for shader-accessible memory.
+    pub upload_arena_mb: Option<usize>,
+    /// Texture pool: maximum spare blocks to keep (each 64 MiB).
+    pub texture_spare_kept: Option<usize>,
+    /// Staging pool: blocks of upload buffers to keep.
+    pub staging_kept: Option<usize>,
+    /// Ripe blocks: blocks made ahead of time to avoid allocation stalls.
+    pub ripe_blocks: Option<usize>,
+    /// Card buffer limits: minimum buffer size in KiB to place in VRAM.
+    pub card_buffers_min_kb: Option<u64>,
+    /// Card buffer limits: maximum VRAM for card buffer copies in MiB.
+    pub card_buffers_mb: Option<u64>,
+}
+
+impl MemoryConfig {
+    fn with_environment(mut self, env: impl Fn(&str) -> Option<std::ffi::OsString>) -> Self {
+        fn numeric<T: std::str::FromStr>(value: Option<String>, fallback: Option<T>) -> Option<T> {
+            value.and_then(|v| v.trim().parse().ok()).or(fallback)
+        }
+        let text = |name: &str| env(name).and_then(|v| v.into_string().ok());
+        if let Some(value) = text("VICTORY_LOW_RAM") {
+            match value.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" => self.low_ram = Some(true),
+                "0" | "false" => self.low_ram = Some(false),
+                _ => {}
+            }
+        }
+        self.arena_mb = numeric(text("VICTORY_ARENA_MB"), self.arena_mb);
+        self.max_pages = numeric(text("VICTORY_MAX_PAGES"), self.max_pages);
+        self.faults_per_frame = numeric(text("VICTORY_FAULTS_PER_FRAME"), self.faults_per_frame);
+        self.faults_all = numeric(text("VICTORY_FAULTS_ALL"), self.faults_all);
+        self.upload_arena_mb = numeric(text("VICTORY_UPLOAD_ARENA_MB"), self.upload_arena_mb);
+        self.texture_spare_kept =
+            numeric(text("VICTORY_TEXTURE_SPARE_KEPT"), self.texture_spare_kept);
+        self.staging_kept = numeric(text("VICTORY_STAGING_KEPT"), self.staging_kept);
+        self.ripe_blocks = numeric(text("VICTORY_RIPE_BLOCKS"), self.ripe_blocks);
+        self.card_buffers_min_kb = numeric(
+            text("VICTORY_CARD_BUFFERS_MIN_KB"),
+            self.card_buffers_min_kb,
+        );
+        self.card_buffers_mb = numeric(text("VICTORY_CARD_BUFFERS_MB"), self.card_buffers_mb);
+        self
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -31,6 +92,8 @@ pub struct Config {
 struct FileConfig {
     #[serde(default)]
     paths: FilePaths,
+    #[serde(default)]
+    memory: MemoryConfig,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -70,11 +133,11 @@ impl Config {
             }
             None => (None, FileConfig::default()),
         };
-        Self::resolve(parsed.paths, source, |k| std::env::var_os(k))
+        Self::resolve(parsed, source, |k| std::env::var_os(k))
     }
 
     fn resolve(
-        file: FilePaths,
+        file: FileConfig,
         source: Option<PathBuf>,
         env: impl Fn(&str) -> Option<std::ffi::OsString>,
     ) -> Result<Self> {
@@ -83,20 +146,21 @@ impl Config {
             Some(v) if !v.is_empty() => std::env::split_paths(&v)
                 .filter(|p| !p.as_os_str().is_empty())
                 .collect(),
-            _ => file.test_titles,
+            _ => file.paths.test_titles,
         };
         let cache_dir = env_path("VICTORY_CACHE_DIR")
-            .or(file.cache_dir)
+            .or(file.paths.cache_dir)
             .map_or_else(|| default_dir("cache"), Ok)?;
         let data_dir = env_path("VICTORY_DATA_DIR")
-            .or(file.data_dir)
+            .or(file.paths.data_dir)
             .map_or_else(|| default_dir("data"), Ok)?;
         Ok(Config {
-            game_dir: env_path("VICTORY_GAME_DIR").or(file.game_dir),
+            game_dir: env_path("VICTORY_GAME_DIR").or(file.paths.game_dir),
             cache_dir,
             data_dir,
             test_titles,
             source,
+            memory: file.memory.with_environment(env),
         })
     }
 
@@ -157,7 +221,15 @@ mod tests {
             ..Default::default()
         };
         let env = |k: &str| (k == "VICTORY_GAME_DIR").then(|| OsString::from("from-env"));
-        let cfg = Config::resolve(file, None, env).unwrap();
+        let cfg = Config::resolve(
+            FileConfig {
+                paths: file,
+                ..Default::default()
+            },
+            None,
+            env,
+        )
+        .unwrap();
         assert_eq!(cfg.game_dir.unwrap(), PathBuf::from("from-env"));
         assert_eq!(cfg.cache_dir, PathBuf::from("cache-from-file"));
     }
@@ -169,7 +241,15 @@ mod tests {
             ..Default::default()
         };
         let env = |k: &str| (k == "VICTORY_GAME_DIR").then(OsString::new);
-        let cfg = Config::resolve(file, None, env).unwrap();
+        let cfg = Config::resolve(
+            FileConfig {
+                paths: file,
+                ..Default::default()
+            },
+            None,
+            env,
+        )
+        .unwrap();
         assert_eq!(cfg.game_dir.unwrap(), PathBuf::from("from-file"));
     }
 
@@ -180,7 +260,15 @@ mod tests {
             ..Default::default()
         };
         let env = |k: &str| (k == "VICTORY_TEST_TITLES").then(OsString::new);
-        let cfg = Config::resolve(file, None, env).unwrap();
+        let cfg = Config::resolve(
+            FileConfig {
+                paths: file,
+                ..Default::default()
+            },
+            None,
+            env,
+        )
+        .unwrap();
         assert_eq!(cfg.test_titles, vec![PathBuf::from("from-file")]);
     }
 
@@ -189,7 +277,15 @@ mod tests {
         let value = std::env::join_paths(["first", "second"]).unwrap();
         let file = FilePaths::default();
         let env = |k: &str| (k == "VICTORY_TEST_TITLES").then(|| value.clone());
-        let cfg = Config::resolve(file, None, env).unwrap();
+        let cfg = Config::resolve(
+            FileConfig {
+                paths: file,
+                ..Default::default()
+            },
+            None,
+            env,
+        )
+        .unwrap();
         assert_eq!(
             cfg.test_titles,
             vec![PathBuf::from("first"), PathBuf::from("second")]
@@ -212,6 +308,29 @@ mod tests {
         let text = include_str!("../../../victory.example.toml");
         let parsed: FileConfig = toml::from_str(text).unwrap();
         assert!(parsed.paths.game_dir.is_some());
+    }
+
+    #[test]
+    fn configured_memory_survives_resolution() {
+        let parsed: FileConfig = toml::from_str("[memory]\nlow_ram = true\narena_mb = 32").unwrap();
+        let cfg = Config::resolve(parsed, None, |_| None).unwrap();
+        assert_eq!(cfg.memory.low_ram, Some(true));
+        assert_eq!(cfg.memory.arena_mb, Some(32));
+    }
+
+    #[test]
+    fn memory_environment_overrides_only_named_values() {
+        let cfg: FileConfig =
+            toml::from_str("[memory]\nlow_ram = false\narena_mb = 24\nstaging_kept = 1").unwrap();
+        let resolved = Config::resolve(cfg, None, |key| match key {
+            "VICTORY_LOW_RAM" => Some("1".into()),
+            "VICTORY_ARENA_MB" => Some("48".into()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(resolved.memory.low_ram, Some(true));
+        assert_eq!(resolved.memory.arena_mb, Some(48));
+        assert_eq!(resolved.memory.staging_kept, Some(1));
     }
 
     #[test]

@@ -81,23 +81,26 @@ fn make(device: &ID3D12Device) -> windows::core::Result<Pass> {
     // SAFETY: the blob's own bytes (the root signature is inside the
     // shader); plain object creation and queries.
     unsafe {
-        let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+        let bytes =
+            std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
         let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
-        let pso: ID3D12PipelineState = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
-            pRootSignature: std::mem::transmute_copy(&root),
-            CS: D3D12_SHADER_BYTECODE {
-                pShaderBytecode: bytes.as_ptr().cast(),
-                BytecodeLength: bytes.len(),
-            },
-            ..Default::default()
-        })?;
+        let pso: ID3D12PipelineState =
+            device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                CS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: bytes.as_ptr().cast(),
+                    BytecodeLength: bytes.len(),
+                },
+                ..Default::default()
+            })?;
         let kind = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        let views: ID3D12DescriptorHeap = device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-            Type: kind,
-            NumDescriptors: SLOTS * 3,
-            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-            NodeMask: 0,
-        })?;
+        let views: ID3D12DescriptorHeap =
+            device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: kind,
+                NumDescriptors: SLOTS * 3,
+                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                NodeMask: 0,
+            })?;
         Ok(Pass {
             cpu: views.GetCPUDescriptorHandleForHeapStart().ptr,
             gpu: views.GetGPUDescriptorHandleForHeapStart().ptr,
@@ -139,7 +142,11 @@ pub(crate) fn record(
     if !rgba8(gd.Format) || !rgba8(ud.Format) {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
-            tracing::warn!(game = gd.Format.0, ui = ud.Format.0, "present planes not laid over each other: a format this pass does not read");
+            tracing::warn!(
+                game = gd.Format.0,
+                ui = ud.Format.0,
+                "present planes not laid over each other: a format this pass does not read"
+            );
         });
         return None;
     }
@@ -147,7 +154,10 @@ pub(crate) fn record(
     if kept.is_none() {
         *kept = Some(match make(device) {
             Ok(p) => {
-                tracing::info!(premultiplied = premultiplied(), "present planes: the interface is laid over the game");
+                tracing::info!(
+                    premultiplied = premultiplied(),
+                    "present planes: the interface is laid over the game"
+                );
                 Some(p)
             }
             Err(e) => {
@@ -170,7 +180,10 @@ pub(crate) fn record(
             DepthOrArraySize: 1,
             MipLevels: 1,
             Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
             Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
             Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
             ..Default::default()
@@ -179,7 +192,14 @@ pub(crate) fn record(
         // SAFETY: plain creation of a device-local texture.
         unsafe {
             device
-                .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_SOURCE, None, &mut out)
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    None,
+                    &mut out,
+                )
                 .ok()?;
         }
         pass.out = Some((w, h, out?));
@@ -187,8 +207,12 @@ pub(crate) fn record(
     let out = pass.out.as_ref()?.2.clone();
     let first = (pass.next % SLOTS) * 3;
     pass.next = pass.next.wrapping_add(1);
-    let cpu = |i: u32| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: pass.cpu + ((first + i) * pass.step) as usize };
-    let gpu = D3D12_GPU_DESCRIPTOR_HANDLE { ptr: pass.gpu + u64::from(first * pass.step) };
+    let cpu = |i: u32| D3D12_CPU_DESCRIPTOR_HANDLE {
+        ptr: pass.cpu + ((first + i) * pass.step) as usize,
+    };
+    let gpu = D3D12_GPU_DESCRIPTOR_HANDLE {
+        ptr: pass.gpu + u64::from(first * pass.step),
+    };
     let srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
         Format: DXGI_FORMAT_R8G8B8A8_UNORM,
         ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
@@ -205,7 +229,10 @@ pub(crate) fn record(
         Format: DXGI_FORMAT_R8G8B8A8_UNORM,
         ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
         Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
-            Texture2D: D3D12_TEX2D_UAV { MipSlice: 0, PlaneSlice: 0 },
+            Texture2D: D3D12_TEX2D_UAV {
+                MipSlice: 0,
+                PlaneSlice: 0,
+            },
         },
     };
     let read = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
@@ -213,11 +240,19 @@ pub(crate) fn record(
     let t = crate::host::transition;
     let mut before = vec![
         t(game, D3D12_RESOURCE_STATE_COPY_SOURCE, read),
-        t(&out, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+        t(
+            &out,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        ),
     ];
     let mut after = vec![
         t(game, read, D3D12_RESOURCE_STATE_COPY_SOURCE),
-        t(&out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
+        t(
+            &out,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+        ),
     ];
     if ui_state != read {
         before.push(t(ui, ui_state, read));

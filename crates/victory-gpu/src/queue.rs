@@ -110,7 +110,9 @@ fn split() -> bool {
 #[cfg(windows)]
 pub(crate) fn cuts() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    waits() && split() && *ON.get_or_init(|| std::env::var_os("VICTORY_CUT_WAITS").is_none_or(|v| v != "0"))
+    waits()
+        && split()
+        && *ON.get_or_init(|| std::env::var_os("VICTORY_CUT_WAITS").is_none_or(|v| v != "0"))
 }
 
 /// Whether a present runs what queues still hold (on by default: a wait
@@ -370,10 +372,15 @@ pub(crate) fn release_held(all: bool) {
                         // each range shaders write compared once).
                         #[cfg(feature = "diagnostics")]
                         {
-                            let waits = held.iter().take_while(|h| matches!(h, Held::Value(_))).count();
+                            let waits = held
+                                .iter()
+                                .take_while(|h| matches!(h, Held::Value(_)))
+                                .count();
                             if waits > 0
                                 && matches!(held.get(waits), Some(Held::Run(..)))
-                                && held[..waits].iter().all(|h| matches!(h, Held::Value(w) if w.met()))
+                                && held[..waits]
+                                    .iter()
+                                    .all(|h| matches!(h, Held::Value(w) if w.met()))
                             {
                                 crate::copystat::add(crate::copystat::C::PartsTogether, 1);
                             }
@@ -595,7 +602,11 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
             if !unmet.is_empty() {
                 static SEEN: AtomicU64 = AtomicU64::new(0);
                 if SEEN.fetch_add(1, Ordering::Relaxed) < 8 {
-                    tracing::info!(kind = queue(this).kind, ?unmet, "a submission is held for a memory value");
+                    tracing::info!(
+                        kind = queue(this).kind,
+                        ?unmet,
+                        "a submission is held for a memory value"
+                    );
                 }
                 lock(&queue(this).held).extend(unmet.into_iter().map(Held::Value));
                 let mut waiting = lock(&WAITING);
@@ -712,11 +723,21 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
         {
             static CALLS: AtomicU64 = AtomicU64::new(0);
             if CALLS.fetch_add(1, Ordering::Relaxed) < 8 {
-                tracing::info!(kind = queue(this).kind, now, value, "a queue is told to wait for a fence");
+                tracing::info!(
+                    kind = queue(this).kind,
+                    now,
+                    value,
+                    "a queue is told to wait for a fence"
+                );
             }
         }
         #[cfg(feature = "diagnostics")]
-        crate::capture::op(this as usize, || format!("WAIT queue kind {} for fence {fence:?} value {value} (now {now})", queue(this).kind));
+        crate::capture::op(this as usize, || {
+            format!(
+                "WAIT queue kind {} for fence {fence:?} value {value} (now {now})",
+                queue(this).kind
+            )
+        });
         if behind::on() && waits() {
             behind::wait(this, fence, value);
             return S_OK;
@@ -785,7 +806,8 @@ impl Written {
             Written::GpuTimestamp => {
                 static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
                 let elapsed = START.get_or_init(std::time::Instant::now).elapsed();
-                let now = (elapsed.as_nanos() / (1_000_000_000 / u128::from(TIMESTAMP_FREQUENCY))) as u64;
+                let now =
+                    (elapsed.as_nanos() / (1_000_000_000 / u128::from(TIMESTAMP_FREQUENCY))) as u64;
                 #[cfg(all(windows, feature = "diagnostics"))]
                 crate::host::spans::stamped(at as usize, now);
                 as_loaded(now, at as usize, gpu_load())
@@ -815,7 +837,10 @@ impl Written {
 fn gpu_load() -> u64 {
     static LOAD: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *LOAD.get_or_init(|| {
-        let ms = std::env::var("VICTORY_GPU_LOAD_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0);
+        let ms = std::env::var("VICTORY_GPU_LOAD_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0);
         ms * (TIMESTAMP_FREQUENCY / 1000)
     })
 }
@@ -946,11 +971,16 @@ extern "system" fn present(
             // The state the lists recorded so far leave it in (the next
             // frame's, recorded before this is shown, go on from there).
             crate::resource::host_copy(resource).map(|copy| {
-                let state = crate::resource::host_transition(resource, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
+                let state = crate::resource::host_transition(resource, COPY_SOURCE)
+                    .map_or(COPY_SOURCE, |(_, before)| before);
                 crate::resource::host_transition(resource, state);
                 // (Lists not translated yet leave it in no state yet: the
                 // one it is in when its turn in the line comes.)
-                let state = if crate::list::thin::wanted() { u32::MAX } else { state };
+                let state = if crate::list::thin::wanted() {
+                    u32::MAX
+                } else {
+                    state
+                };
                 (resource as usize, copy, state)
             })
         } else {
@@ -958,9 +988,25 @@ extern "system" fn present(
         };
         let resource = texture.as_ref().map_or(0, |t| t.0);
         // LOCAL (port of fxceless #1189): the interface plane, as the first.
-        let over = second_plane(planes, plane_parameters, resource as This)
-            .map(|(copy, state)| (copy, if crate::list::thin::wanted() { u32::MAX } else { state }));
-        behind::present(this, texture.map(|(_, copy, state)| (copy, state)), Shown { frame, resource, over });
+        let over = second_plane(planes, plane_parameters, resource as This).map(|(copy, state)| {
+            (
+                copy,
+                if crate::list::thin::wanted() {
+                    u32::MAX
+                } else {
+                    state
+                },
+            )
+        });
+        behind::present(
+            this,
+            texture.map(|(_, copy, state)| (copy, state)),
+            Shown {
+                frame,
+                resource,
+                over,
+            },
+        );
         called.end();
         #[cfg(feature = "diagnostics")]
         frame_ends();
@@ -981,7 +1027,15 @@ extern "system" fn present(
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
         let over = second_plane(planes, plane_parameters, resource);
-        show(texture, state, Shown { frame, resource: resource as usize, over });
+        show(
+            texture,
+            state,
+            Shown {
+                frame,
+                resource: resource as usize,
+                over,
+            },
+        );
         crate::resource::host_transition(resource, state);
         let _ = host;
     }
@@ -1023,14 +1077,20 @@ struct Shown {
 /// A Series S title presents two planes: the game and the interface
 /// (menus, loading screens, the intro), 72-byte descriptions each.
 #[cfg(windows)]
-fn second_plane(planes: u32, plane_parameters: *const Plane, first: This) -> Option<(std::sync::Arc<crate::resource::HostTexture>, u32)> {
+fn second_plane(
+    planes: u32,
+    plane_parameters: *const Plane,
+    first: This,
+) -> Option<(std::sync::Arc<crate::resource::HostTexture>, u32)> {
     const STRIDE: usize = 72;
     const COPY_SOURCE: u32 = 0x800;
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let on = *ON.get_or_init(|| {
         let on = std::env::var_os("VICTORY_COMPOSE").is_some_and(|v| v == "1");
         if on {
-            tracing::warn!("LOCAL present planes: a second plane is laid over the first (VICTORY_COMPOSE=1)");
+            tracing::warn!(
+                "LOCAL present planes: a second plane is laid over the first (VICTORY_COMPOSE=1)"
+            );
         }
         on
     });
@@ -1038,7 +1098,13 @@ fn second_plane(planes: u32, plane_parameters: *const Plane, first: This) -> Opt
         return None;
     }
     // SAFETY: the title passes `planes` descriptions of `STRIDE` bytes.
-    let plane = unsafe { plane_parameters.cast::<u8>().add(STRIDE).cast::<Plane>().as_ref() }?;
+    let plane = unsafe {
+        plane_parameters
+            .cast::<u8>()
+            .add(STRIDE)
+            .cast::<Plane>()
+            .as_ref()
+    }?;
     if plane.count == 0 || plane.resources.is_null() {
         return None;
     }
@@ -1048,7 +1114,8 @@ fn second_plane(planes: u32, plane_parameters: *const Plane, first: This) -> Opt
         return None;
     }
     let copy = crate::resource::host_copy(resource)?;
-    let state = crate::resource::host_transition(resource, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
+    let state = crate::resource::host_transition(resource, COPY_SOURCE)
+        .map_or(COPY_SOURCE, |(_, before)| before);
     crate::resource::host_transition(resource, state);
     Some((copy, state))
 }
@@ -1069,11 +1136,23 @@ fn note_planes(planes: u32, plane_parameters: *const Plane) {
     }
     for i in 0..planes.min(4) as usize {
         // SAFETY: the title passes `planes` descriptions of `STRIDE` bytes.
-        let Some(plane) = (unsafe { plane_parameters.cast::<u8>().add(i * STRIDE).cast::<Plane>().as_ref() }) else {
+        let Some(plane) = (unsafe {
+            plane_parameters
+                .cast::<u8>()
+                .add(i * STRIDE)
+                .cast::<Plane>()
+                .as_ref()
+        }) else {
             continue;
         };
         if plane.resources.is_null() {
-            tracing::warn!(frame, planes, plane = i, count = plane.count, "present plane without resources");
+            tracing::warn!(
+                frame,
+                planes,
+                plane = i,
+                count = plane.count,
+                "present plane without resources"
+            );
             continue;
         }
         for k in 0..plane.count.min(2) as usize {
@@ -1101,7 +1180,11 @@ fn show(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u
         return;
     };
     let over = what.over.as_ref().map(|(t, s)| {
-        let s = if *s == u32::MAX { t.state.load(Ordering::Relaxed) } else { *s };
+        let s = if *s == u32::MAX {
+            t.state.load(Ordering::Relaxed)
+        } else {
+            *s
+        };
         (&t.texture, s)
     });
     let shown = host.present_over(texture, state, over, what.frame);
@@ -1227,7 +1310,9 @@ extern "system" fn copy_page_mappings(
     }
     if !ok {
         static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed"));
+        ONCE.call_once(|| {
+            tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed")
+        });
     }
     S_OK
 }
@@ -1360,7 +1445,10 @@ mod tests {
     #[test]
     fn a_pair_of_timestamps_shows_the_load_it_is_given() {
         let (start, end) = (0xd0419_6698, 0xd0419_6690);
-        assert_eq!(as_loaded(5_000_000, end, 4_000_000) - as_loaded(5_000_000, start, 4_000_000), 4_000_000);
+        assert_eq!(
+            as_loaded(5_000_000, end, 4_000_000) - as_loaded(5_000_000, start, 4_000_000),
+            4_000_000
+        );
         assert_eq!(as_loaded(5_000_000, start, 0), 5_000_000);
         assert_eq!(as_loaded(5, start, 100), 1);
     }

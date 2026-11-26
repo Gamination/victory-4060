@@ -17,3 +17,61 @@ game_dir = 'D:\victory-data\game'
 # Other Xbox Series titles used to test platform-level code.
 # env: VICTORY_TEST_TITLES (separated by ';')
 test_titles = []
+
+[memory]
+# Enable low-RAM optimizations for systems with 16GB or less RAM.
+# Use true or false in TOML. The environment override also accepts 1 or 0.
+# If not set, auto-detects based on physical RAM (16GB threshold).
+# env: VICTORY_LOW_RAM
+# low_ram = false
+
+# Arena size in MiB for title memory outside buffers.
+# Default: 64 MiB (32 MiB when low_ram is enabled).
+# env: VICTORY_ARENA_MB
+# arena_mb = 64
+
+# Maximum pages of title memory to keep (in 64 KiB pages).
+# Default: 49152 (3 GiB) / 16384 (1 GiB when low_ram is enabled).
+# env: VICTORY_MAX_PAGES
+# max_pages = 49152
+
+# Maximum page faults to handle per frame.
+# Default: 128 (64 when low_ram is enabled).
+# env: VICTORY_FAULTS_PER_FRAME
+# faults_per_frame = 128
+
+# Maximum total page faults to handle across all frames.
+# Default: 2048 (1024 when low_ram is enabled).
+# env: VICTORY_FAULTS_ALL
+# faults_all = 2048
+
+# Upload arena size in MiB for shader-accessible memory.
+# Default: 4 MiB (2 MiB when low_ram is enabled).
+# env: VICTORY_UPLOAD_ARENA_MB
+# upload_arena_mb = 4
+
+# Texture pool: maximum spare blocks to keep (each 64 MiB).
+# Default: 64 (2 when low_ram is enabled).
+# env: VICTORY_TEXTURE_SPARE_KEPT
+# texture_spare_kept = 64
+
+# Staging pool: blocks of upload buffers to keep.
+# Maximum: 2 (1 in low-RAM mode). Below 2 GiB available, the limit is 0.
+# env: VICTORY_STAGING_KEPT
+# staging_kept = 2
+
+# Ripe blocks: blocks made ahead of time to avoid allocation stalls.
+# Default: 12 (capped at 6 when low_ram is enabled).
+# env: VICTORY_RIPE_BLOCKS
+# ripe_blocks = 12
+
+# Card buffer limits (VRAM copies of large title buffers).
+# Minimum buffer size in KiB to place in VRAM.
+# Default: auto (1 MiB when low_ram is enabled).
+# env: VICTORY_CARD_BUFFERS_MIN_KB
+# card_buffers_min_kb = 1024
+
+# Maximum VRAM for card buffer copies in MiB.
+# Default: auto (256 MiB when low_ram is enabled).
+# env: VICTORY_CARD_BUFFERS_MB
+# card_buffers_mb = 256

@@ -17,7 +17,10 @@ extern "system" fn create_device(
     iid: *const Iid,
     out: *mut *const Object,
 ) -> HRESULT {
-    victory_gpu::resource::use_zeroed_allocator(super::xmem::alloc_zeroed_resource, super::xmem::XMemFree);
+    victory_gpu::resource::use_zeroed_allocator(
+        super::xmem::alloc_zeroed_resource,
+        super::xmem::XMemFree,
+    );
     victory_gpu::resource::use_page_mapper(super::xmem::map_alias);
     victory_gpu::resource::use_many_page_mapper(super::xmem::map_aliases);
     #[cfg(windows)]

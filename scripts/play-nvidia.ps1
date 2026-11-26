@@ -117,7 +117,8 @@ if (-not $NoSmoothMotion) {
     $victory = $sm
 }
 # (Other settings left over in this window go; where your files are stays.)
-$paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR'
+$paths = 'VICTORY_CONFIG', 'VICTORY_GAME_DIR', 'VICTORY_CACHE_DIR', 'VICTORY_DATA_DIR', 'VICTORY_LOW_RAM',
+    'VICTORY_ARENA_MB', 'VICTORY_MAX_PAGES', 'VICTORY_FAULTS_PER_FRAME', 'VICTORY_FAULTS_ALL', 'VICTORY_UPLOAD_ARENA_MB', 'VICTORY_TEXTURE_SPARE_KEPT', 'VICTORY_STAGING_KEPT', 'VICTORY_RIPE_BLOCKS', 'VICTORY_CARD_BUFFERS_MIN_KB', 'VICTORY_CARD_BUFFERS_MB'
 Get-ChildItem Env:VICTORY_* | Where-Object { $_.Name -notin $paths } | ForEach-Object { Remove-Item "Env:$($_.Name)" }
 foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
 $Exe = (Resolve-Path $Exe).Path

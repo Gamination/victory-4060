@@ -277,6 +277,21 @@ VRAM while at least 20% of the reported local budget remains free. The fallback
 uses system-RAM upload buffers. To compare the two paths on the same scene,
 pass `-More @{VICTORY_TEXTURE_BAR='0'}` to `scripts/play-nvidia.ps1`.
 
+#### Low-RAM optimizations (16GB and under)
+
+On systems with 16GB or less physical RAM, Victory automatically enables
+memory optimizations to reduce pressure:
+
+- **Reduced arena size**: Title memory arenas use 32 MiB instead of 64 MiB
+- **Reduced max pages**: Up to 1 GiB of title memory pages instead of 3 GiB
+- Low-RAM mode retains at most one empty staging block. Below 2 GiB of available RAM it releases every eligible empty block.
+- **Reduced faults**: 64 page faults per frame instead of 128
+- **Reduced card buffers**: Capped at 256 MiB VRAM for title buffer copies
+- **Reduced ripe blocks**: Maximum 6 texture blocks made ahead instead of 12
+
+To manually enable or disable low-RAM mode, set the environment variable
+`VICTORY_LOW_RAM=1` or `VICTORY_LOW_RAM=0`.
+
 The periodic sweep can release empty staging blocks after their submissions
 finish. It keeps up to 128 MiB of empty staging blocks and drops that allowance
 to zero below 2 GiB of available physical RAM. Live textures, buffers, and
@@ -289,8 +304,7 @@ model 6.6 and mesh shaders, Rust (the toolchain is pinned), the MSVC build
 tools, and your own dump of the title.
 
 ```powershell
-git clone --branch work https://github.com/Gamination/victory-4060.git
-cd victory-4060
+# Open PowerShell in the extracted combined source folder.
 copy victory.example.toml victory.toml      # then set your paths, outside this folder
 cargo build --locked --profile diag -p victory --features diagnostics
 scripts\play-nvidia.ps1 -Exe <path of your copy's executable>
