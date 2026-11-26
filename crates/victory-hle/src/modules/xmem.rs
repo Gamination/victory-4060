@@ -91,15 +91,16 @@ pub extern "system" fn XMemVirtualAlloc(
     flags: u64,
     protect: u32,
 ) -> *mut c_void {
+    let alignment = if kind & (PAGES_2M | PAGES_64K_BIT) == PAGES_2M { 2 * MIB } else { 0 };
+    virtual_alloc(base, size, kind, flags, protect, alignment)
+}
+
+fn virtual_alloc(base: *mut c_void, size: usize, kind: u32, flags: u64, protect: u32, alignment: usize) -> *mut c_void {
     let (lowest, highest) = address_range(flags);
     let mut requirements = MEM_ADDRESS_REQUIREMENTS {
         LowestStartingAddress: lowest as *mut c_void,
         HighestEndingAddress: highest as *mut c_void,
-        Alignment: if kind & (PAGES_2M | PAGES_64K_BIT) == PAGES_2M {
-            2 * MIB
-        } else {
-            0
-        },
+        Alignment: alignment,
     };
     let asked = protect;
     let mut protect = match protect & HOST_PROTECTION {
@@ -294,7 +295,11 @@ fn hooks() -> [usize; 2] {
 /// The title's general allocator, for middleware too: its hook if it has
 /// one, else [`XMemAllocDefault`].
 pub extern "system" fn XMemAlloc(size: usize, attributes: u64) -> *mut c_void {
-    match hooks()[0] {
+    alloc_with_hook(size, attributes, hooks()[0])
+}
+
+fn alloc_with_hook(size: usize, attributes: u64, hook: usize) -> *mut c_void {
+    match hook {
         0 => XMemAllocDefault(size, attributes),
         hook => {
             // SAFETY: the title's own routine of this type.
@@ -318,13 +323,15 @@ pub extern "system" fn XMemFree(address: *mut c_void, attributes: u64) {
 
 /// The system allocator behind [`XMemAlloc`].
 pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_void {
-    if attributes & ALLOC_32BIT != 0 {
-        return XMemVirtualAlloc(
+    if virtual_block(attributes) {
+        let alignment = 1usize << (attributes >> ALIGNMENT_SHIFT & 0x1f);
+        return virtual_alloc(
             std::ptr::null_mut(),
-            size,
+            size.max(1),
             MEM_RESERVE | MEM_COMMIT,
-            GRAPHICS | ADDRESS_32BIT,
+            GRAPHICS | if attributes & ALLOC_32BIT != 0 { ADDRESS_32BIT } else { 0 },
             PAGE_READWRITE,
+            alignment.max(PAGE),
         );
     }
     let Some(layout) = layout(size, attributes) else {
@@ -351,6 +358,25 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
     }
 }
 
+/// Page-aligned allocations need no allocator header or extra alignment's
+/// worth of committed memory. Windows supplies demand-zero, write-watched
+/// pages at a console-addressable address. Small allocations stay packed.
+fn virtual_block(attributes: u64) -> bool {
+    attributes & ALLOC_32BIT != 0 || (attributes >> ALIGNMENT_SHIFT & 0x1f) >= 16
+}
+
+/// Committed resources start zeroed. A title allocator can recycle dirty
+/// bytes; a fresh private Windows allocation already has the required zeros.
+pub(crate) extern "system" fn alloc_zeroed_resource(size: usize, attributes: u64) -> *mut c_void {
+    let hook = hooks()[0];
+    let p = alloc_with_hook(size, attributes, hook);
+    if !p.is_null() && (hook != 0 || !virtual_block(attributes)) {
+        // SAFETY: the selected allocator returned at least size writable bytes.
+        unsafe { p.cast::<u8>().write_bytes(0, size) };
+    }
+    p
+}
+
 /// Frees what [`XMemAllocDefault`] returned, given the same attributes.
 pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     if address.is_null() {
@@ -359,8 +385,8 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // SAFETY: the address came from `XMemAlloc` with these attributes: a
     // whole reservation, or a header-prefixed block.
     unsafe {
-        if attributes & ALLOC_32BIT != 0 {
-            VirtualFree(address, 0, MEM_RELEASE);
+        if virtual_block(attributes) {
+            title_virtual_free(address, 0, MEM_RELEASE);
             return;
         }
         let user = address.cast::<u8>();
@@ -1958,6 +1984,33 @@ mod tests {
         let p = XMemAlloc(4096, ALLOC_32BIT);
         assert!(!p.is_null() && (p as usize) < 1 << 32);
         XMemFree(p, ALLOC_32BIT);
+    }
+
+    #[test]
+    fn graphics_backing_is_demand_zero_and_tracks_cpu_writes() {
+        use windows_sys::Win32::System::Memory::GetWriteWatch;
+        const SIZE: usize = 16 * MIB;
+        let attributes = (21 << ALIGNMENT_SHIFT) | (1 << 29);
+        let p = alloc_zeroed_resource(SIZE, attributes);
+        assert!(!p.is_null());
+        assert_eq!(p as usize % (2 * MIB), 0);
+        assert!((p as usize) + SIZE <= 1 << 40);
+        let written = || {
+            let mut pages = vec![std::ptr::null_mut(); SIZE / 4096];
+            let mut count = pages.len();
+            let mut granularity = 0;
+            // SAFETY: p is live and the output holds one address per OS page.
+            assert_eq!(unsafe { GetWriteWatch(0, p, SIZE, pages.as_mut_ptr(), &mut count, &mut granularity) }, 0);
+            pages.truncate(count);
+            pages
+        };
+        assert!(written().is_empty());
+        // SAFETY: both bytes are in the allocation. Check the written pages
+        // before faulting in a different demand-zero page for the read.
+        unsafe { p.cast::<u8>().add(4096).write_volatile(0xab) };
+        assert_eq!(written(), vec![p.wrapping_byte_add(4096)]);
+        assert_eq!(unsafe { p.cast::<u8>().add(SIZE - 1).read_volatile() }, 0);
+        XMemFree(p, attributes);
     }
 
     #[test]

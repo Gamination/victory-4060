@@ -10,9 +10,8 @@
 //! forty seconds of a world without its textures.
 //! `VICTORY_TEXTURE_POOL=0` makes every one an allocation of its own again.
 //!
-//! A piece given back is used again only two seconds later (nothing the card
-//! was told before that is still running: Windows resets a card that takes
-//! that long over one submission), and by then no list names it (the owners' rule, as for allocations of their own): a
+//! A returned piece waits for the submissions already in flight and the
+//! reuse delay. Lists keep references to the allocations they name: a
 //! texture's piece comes back when the last reference to the host texture
 //! goes (an object of ours the texture holds says so), a staging buffer's
 //! when the last list that recorded its copy is reset.
@@ -34,20 +33,33 @@ const SPARE: usize = 2;
 const SPARE_KEPT: usize = 64;
 /// The same of blocks of staging buffers, which are the PC's memory: run
 /// crash-1 held 5.2 GB of them.
-const STAGING_KEPT: usize = 8;
+const STAGING_KEPT: usize = 2;
 /// How many are kept now.
 static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 
-/// Sets how many empty blocks stay, by the card's memory (budget and use):
-/// [`SPARE_KEPT`] below 85 % ([`crate::host::keep_freed`]), else [`SPARE`].
-/// Asked once a second.
+/// Reclaim returned pieces even when streaming stops making allocations.
+/// Size empty texture and upload pools against local VRAM and RAM respectively.
 pub(crate) fn room(memory: Option<[u64; 4]>) {
-    SPARES.store(spares(memory, crate::host::keep_freed()), Ordering::Relaxed);
+    let textures = spares(memory, crate::host::keep_freed());
+    SPARES.store(textures, Ordering::Relaxed);
+    let now = now();
+    let finished = crate::host::submissions().1;
+    lock(&TEXTURES).trim(now, textures, finished);
+    let available = crate::host::available_physical_ram();
+    let staging = match available {
+        Some(bytes) if bytes < 2 << 30 => 0,
+        Some(bytes) if bytes >= 4 << 30 => STAGING_KEPT,
+        _ => 1,
+    };
+    lock(&STAGING).trim(now, staging, finished);
 }
 
 fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
     match memory {
-        Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => SPARE_KEPT,
+        Some([budget, used, ..]) if keep && u128::from(used) * 100 < u128::from(budget) * 85 => {
+            // Keep at most 1/16 of the local budget in completely empty heaps.
+            (budget / 16 / BLOCK).clamp(SPARE as u64, SPARE_KEPT as u64) as usize
+        }
         _ => SPARE,
     }
 }
@@ -175,16 +187,15 @@ struct Block<B> {
 struct Pool<B> {
     /// `None`: a block let go, its place to be used again.
     blocks: Vec<Option<Block<B>>>,
-    /// Pieces given back, and when each may be used again.
-    resting: VecDeque<(u64, Piece)>,
-    /// The empty blocks it was last told to keep, and the most it keeps.
-    spare: usize,
+    /// Earliest reuse time, last submission in flight, and returned piece.
+    resting: VecDeque<(u64, u64, Piece)>,
+    /// Empty blocks retained after returned pieces have rested.
     most: usize,
 }
 
 impl<B: Clone> Pool<B> {
     const fn new(most: usize) -> Pool<B> {
-        Pool { blocks: Vec::new(), resting: VecDeque::new(), spare: 0, most }
+        Pool { blocks: Vec::new(), resting: VecDeque::new(), most }
     }
 
     /// A piece of `len` bytes and the memory it lies in, and whether that
@@ -265,16 +276,20 @@ impl<B: Clone> Pool<B> {
         i
     }
 
-    fn give(&mut self, piece: Piece, now: u64) {
-        self.resting.push_back((now + REST, piece));
+    fn give(&mut self, piece: Piece, now: u64, submitted: u64) {
+        self.resting.push_back((now + REST, submitted, piece));
     }
 
-    /// Makes the pieces that rested long enough free, and lets go of empty
-    /// blocks past [`SPARE`].
+    /// Makes the pieces that rested long enough free.
     fn rested(&mut self, now: u64) {
-        let mut any = false;
-        while let Some(&(ready, piece)) = self.resting.front()
-            && ready <= now
+        self.trim(now, self.most, crate::host::submissions().1);
+    }
+
+    fn trim(&mut self, now: u64, most: usize, finished: u64) {
+        let mut any = most < self.most;
+        self.most = most;
+        while let Some(&(ready, submission, piece)) = self.resting.front()
+            && ready <= now && submission <= finished
         {
             self.resting.pop_front();
             if let Some(block) = self.blocks[piece.block].as_mut() {
@@ -283,9 +298,7 @@ impl<B: Clone> Pool<B> {
             }
         }
         // (Without a piece given back too, once there is less room.)
-        let most = SPARES.load(Ordering::Relaxed).min(self.most);
-        if any || most < self.spare {
-            self.spare = most;
+        if any {
             let mut spare = 0;
             for block in &mut self.blocks {
                 if block.as_ref().is_some_and(|b| b.free.whole(BLOCK)) {
@@ -309,7 +322,7 @@ struct Upload(ID3D12Resource, *mut u8);
 // SAFETY: the mapping is written by the owners of its pieces, each its own.
 unsafe impl Send for Upload {}
 
-static TEXTURES: Mutex<Pool<ID3D12Heap>> = Mutex::new(Pool::new(SPARE_KEPT));
+static TEXTURES: Mutex<Pool<ID3D12Heap>> = Mutex::new(Pool::new(SPARE));
 static STAGING: Mutex<Pool<Upload>> = Mutex::new(Pool::new(STAGING_KEPT));
 
 fn lock<T>(m: &'static Mutex<T>) -> std::sync::MutexGuard<'static, T> {
@@ -336,7 +349,7 @@ pub(crate) struct StagingPiece(Piece);
 
 impl Drop for StagingPiece {
     fn drop(&mut self) {
-        lock(&STAGING).give(self.0, now());
+        lock(&STAGING).give(self.0, now(), crate::host::submissions().0);
     }
 }
 
@@ -347,12 +360,19 @@ pub(crate) fn staging(host: &crate::host::Host, bytes: u64) -> Option<(StagingPi
         return None;
     }
     // Copies from a buffer begin at multiples of 512.
-    let bytes = bytes.next_multiple_of(512);
-    let (piece, memory, again) = lock(&STAGING).take(bytes, 512, now(), || {
-        let (buffer, data) = host.upload_buffer(BLOCK)?;
+    let bytes = bytes.checked_next_multiple_of(512)?;
+    let mut pool = lock(&STAGING);
+    // Only the first two live blocks may use local memory. Allocation and
+    // removal both hold this lock, including when uploads run ahead.
+    let allow_local = pool.blocks() < 2;
+    let (piece, memory, again) = pool.take(bytes, 512, now(), || {
+        let local = allow_local && host.local_texture_upload_room(BLOCK);
+        let (buffer, data) = if local { host.mapped_card_buffer(BLOCK, false) } else { None }
+            .or_else(|| host.upload_buffer(BLOCK))?;
         crate::host::name(&buffer, || "staging of textures (a block)".into());
         Some(Upload(buffer, data))
     })?;
+    drop(pool);
     let owned = StagingPiece(piece);
     // SAFETY: the piece lies in the block's mapping.
     let data = unsafe { memory.1.add(piece.start as usize) };
@@ -409,7 +429,7 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
         if left == 0 {
             let gone = Box::from_raw(this.cast::<Reclaim>());
             HELD.fetch_sub(gone.piece.len, Ordering::Relaxed);
-            lock(&TEXTURES).give(gone.piece, now());
+            lock(&TEXTURES).give(gone.piece, now(), crate::host::submissions().0);
         }
         left
     }
@@ -528,7 +548,7 @@ pub(crate) unsafe fn texture(
             Some(made)
         }
         _ => {
-            lock(&TEXTURES).give(piece, now());
+            lock(&TEXTURES).give(piece, now(), crate::host::submissions().0);
             None
         }
     }
@@ -554,10 +574,27 @@ mod tests {
 
     #[test]
     fn empty_blocks_stay_while_the_card_has_room() {
-        assert_eq!(spares(Some([100, 84, 0, 0]), true), SPARE_KEPT);
+        assert_eq!(spares(Some([8 << 30, 6 << 30, 0, 0]), true), 8);
         assert_eq!(spares(Some([100, 85, 0, 0]), true), SPARE);
         assert_eq!(spares(Some([100, 10, 0, 0]), false), SPARE);
         assert_eq!(spares(None, true), SPARE);
+    }
+
+    #[test]
+    fn sweeping_an_idle_pool_releases_only_returned_blocks() {
+        let mut pool = Pool::new(2);
+        let (a, _, _) = pool.take(BLOCK / 2, 512, 0, || Some(1)).unwrap();
+        let (b, _, _) = pool.take(BLOCK / 2, 512, 0, || Some(1)).unwrap();
+        let (_live, _, _) = pool.take(BLOCK / 2, 512, 0, || Some(2)).unwrap();
+        pool.give(a, 1, 3);
+        pool.give(b, 1, 3);
+        pool.trim(REST, 0, 3);
+        assert_eq!(pool.blocks(), 2);
+        pool.trim(REST + 1, 0, 2);
+        assert_eq!(pool.blocks(), 2);
+        pool.trim(REST + 1, 0, 3);
+        assert_eq!(pool.blocks(), 1);
+        assert!(pool.blocks[a.block].is_none());
     }
 
     #[test]
@@ -579,14 +616,14 @@ mod tests {
         assert!(blocks >= 2);
         // Given back at 10: not used again before 10 + REST.
         let first = taken[0];
-        pool.give(first, 10);
+        pool.give(first, 10, 0);
         let (p, _, _) = pool.take(first.len, 65536, 10 + REST - 1, make).unwrap();
         assert_ne!((p.block, p.start), (first.block, first.start));
         let (q, _, again) = pool.take(first.len, 65536, 10 + REST, make).unwrap();
         assert_eq!((q.block, q.start, again), (first.block, first.start, true));
         // Everything back: the empty blocks past the spare ones go.
         for p in taken.drain(1..).chain([p, q]) {
-            pool.give(p, 20);
+            pool.give(p, 20, 0);
         }
         pool.rested(20 + REST);
         assert_eq!(pool.blocks(), blocks.min(SPARE));

@@ -9282,6 +9282,20 @@ impl Host {
         })
     }
 
+    /// Choose local staging only on a discrete adapter with CPU-visible VRAM
+    /// and at least a fifth of its current DXGI budget left after allocation.
+    pub(crate) fn local_texture_upload_room(&self, bytes: u64) -> bool {
+        if !crate::toggled!("VICTORY_TEXTURE_BAR") || !self.mapped_card_memory() {
+            return false;
+        }
+        // SAFETY: the device reported GPU_UPLOAD support above.
+        let properties = unsafe { self.device.GetCustomHeapProperties(0, D3D12_HEAP_TYPE_GPU_UPLOAD) };
+        properties.MemoryPoolPreference == D3D12_MEMORY_POOL_L1
+            && self.video_memory().is_some_and(|[budget, used, ..]| {
+                used.checked_add(bytes).is_some_and(|after| after <= budget / 5 * 4)
+            })
+    }
+
     /// A buffer in the card's own memory that the CPU maps, shaders read and
     /// (with `written`) may write. The CPU should only write it: a read of the
     /// mapping crosses the bus a few bytes at a time.
@@ -9322,7 +9336,7 @@ impl Host {
                     &heap,
                     not_resident(),
                     &desc,
-                    D3D12_RESOURCE_STATE_COMMON,
+                    if written { D3D12_RESOURCE_STATE_COMMON } else { D3D12_RESOURCE_STATE_GENERIC_READ },
                     None,
                     &mut buffer,
                 )
@@ -9330,7 +9344,8 @@ impl Host {
                     let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
                     resident(&self.device, b)?;
                     mapped(&self.device)?;
-                    b.Map(0, None, Some(&mut data))
+                    let no_cpu_reads = D3D12_RANGE::default();
+                    b.Map(0, (!written).then_some(&no_cpu_reads as *const _), Some(&mut data))
                 })
         };
         match made {

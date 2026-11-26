@@ -58,6 +58,10 @@ fn gap(taken: &[bool], n: usize) -> Option<usize> {
 /// address reaches, `MEMORY_PAGES`), write-watched as the title's own
 /// pools are (copies then take only written pages).
 pub(crate) fn reserve(len: usize) -> Option<usize> {
+    reserve_aligned(len, 0)
+}
+
+pub(crate) fn reserve_aligned(len: usize, alignment: usize) -> Option<usize> {
     use windows_sys::Win32::System::Memory::{
         MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER, MEM_RESERVE, MemExtendedParameterAddressRequirements,
         PAGE_READWRITE, VirtualAlloc2,
@@ -66,7 +70,7 @@ pub(crate) fn reserve(len: usize) -> Option<usize> {
     let mut requirements = MEM_ADDRESS_REQUIREMENTS {
         LowestStartingAddress: (1usize << 32) as *mut _,
         HighestEndingAddress: ((1usize << 37) - 1) as *mut _,
-        Alignment: 0,
+        Alignment: alignment,
     };
     let mut parameter = MEM_EXTENDED_PARAMETER::default();
     parameter.Anonymous1._bitfield = MemExtendedParameterAddressRequirements as u64;

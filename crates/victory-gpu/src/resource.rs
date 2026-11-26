@@ -934,14 +934,25 @@ fn place<'a>(
 pub(crate) struct Memory {
     ptr: NonNull<u8>,
     layout: Layout,
-    /// Set when the memory came from the title's allocator, with these
-    /// allocation attributes (it goes back there).
-    attributes: Option<u64>,
+    owner: MemoryOwner,
+}
+
+#[derive(Debug)]
+enum MemoryOwner {
+    Process,
+    #[cfg(windows)]
+    Virtual,
+    Title(u64),
 }
 
 pub type AllocRoutine = extern "system" fn(usize, u64) -> *mut c_void;
 pub type FreeRoutine = extern "system" fn(*mut c_void, u64);
-static ALLOCATOR: std::sync::OnceLock<(AllocRoutine, FreeRoutine)> = std::sync::OnceLock::new();
+struct Allocator {
+    alloc: AllocRoutine,
+    free: FreeRoutine,
+    zeroed: bool,
+}
+static ALLOCATOR: std::sync::OnceLock<Allocator> = std::sync::OnceLock::new();
 
 /// Committed resources get their memory from the title's general
 /// allocator, as on the console, where titles hook it to place graphics
@@ -949,7 +960,12 @@ static ALLOCATOR: std::sync::OnceLock<(AllocRoutine, FreeRoutine)> = std::sync::
 /// block of its own and checks they fill it). The runtime names it before
 /// the device exists.
 pub fn use_allocator(alloc: AllocRoutine, free: FreeRoutine) {
-    let _ = ALLOCATOR.set((alloc, free));
+    let _ = ALLOCATOR.set(Allocator { alloc, free, zeroed: false });
+}
+
+/// Like `use_allocator` when the callback itself provides zeroed storage.
+pub fn use_zeroed_allocator(alloc: AllocRoutine, free: FreeRoutine) {
+    let _ = ALLOCATOR.set(Allocator { alloc, free, zeroed: true });
 }
 
 /// Maps the physical pages behind one range of title memory at another,
@@ -1000,20 +1016,22 @@ impl Memory {
     /// A committed resource's memory: from the title's allocator if the
     /// runtime named one, else our own; zeroed either way.
     fn for_resource(info: AllocationInfo, heap_kind: u32) -> Result<Memory, HRESULT> {
-        let Some(&(alloc, _)) = ALLOCATOR.get() else {
+        let Some(allocator) = ALLOCATOR.get() else {
             return Memory::new(info);
         };
         let layout = Layout::from_size_align(info.size as usize, info.alignment as usize)
             .map_err(|_| E_INVALIDARG)?;
         let attributes = resource_attributes(info, heap_kind);
         let ptr =
-            NonNull::new(alloc(layout.size(), attributes).cast::<u8>()).ok_or(E_OUTOFMEMORY)?;
-        // SAFETY: the allocator handed out `size` bytes.
-        unsafe { ptr.as_ptr().write_bytes(0, layout.size()) };
+            NonNull::new((allocator.alloc)(layout.size(), attributes).cast::<u8>()).ok_or(E_OUTOFMEMORY)?;
+        if !allocator.zeroed {
+            // SAFETY: the allocator handed out `size` bytes.
+            unsafe { ptr.as_ptr().write_bytes(0, layout.size()) };
+        }
         Ok(Memory {
             ptr,
             layout,
-            attributes: Some(attributes),
+            owner: MemoryOwner::Title(attributes),
         })
     }
 
@@ -1033,6 +1051,20 @@ impl Memory {
             .filter(|&(size, _)| size > 0)
             .and_then(|(size, align)| Layout::from_size_align(size, align).ok())
             .ok_or(E_INVALIDARG)?;
+        // Heaps exposed to the title need a stable, CPU-writable address.
+        // The kernel supplies zero pages on first touch. Placed resources
+        // share this one reservation, including overlapping aliases.
+        #[cfg(windows)]
+        if layout.align() >= KIB_64 as usize
+            && let Some(at) = crate::upload::reserve_aligned(layout.size(), layout.align())
+        {
+            crate::watch::title_memory_allocated(at, layout.size());
+            return Ok(Memory {
+                ptr: NonNull::new(at as *mut u8).ok_or(E_OUTOFMEMORY)?,
+                layout,
+                owner: MemoryOwner::Virtual,
+            });
+        }
         // SAFETY: the size is non-zero.
         let ptr = NonNull::new(unsafe { alloc_zeroed(layout) }).ok_or(E_OUTOFMEMORY)?;
         // The big ones are named in the log: the memory line counts our own
@@ -1044,17 +1076,26 @@ impl Memory {
         Ok(Memory {
             ptr,
             layout,
-            attributes: None,
+            owner: MemoryOwner::Process,
         })
     }
 }
 
 impl Drop for Memory {
     fn drop(&mut self) {
-        match (self.attributes, ALLOCATOR.get()) {
-            (Some(attributes), Some(&(_, free))) => free(self.ptr.as_ptr().cast(), attributes),
+        match self.owner {
+            MemoryOwner::Title(attributes) => {
+                (ALLOCATOR.get().expect("title allocator installed").free)(self.ptr.as_ptr().cast(), attributes)
+            }
+            #[cfg(windows)]
+            MemoryOwner::Virtual => {
+                use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+                crate::watch::title_memory_freed(self.ptr.as_ptr() as usize, self.layout.size());
+                // SAFETY: the base of our own VirtualAlloc2 reservation.
+                unsafe { VirtualFree(self.ptr.as_ptr().cast(), 0, MEM_RELEASE) };
+            }
             // SAFETY: allocated in `new` with this layout.
-            _ => unsafe { dealloc(self.ptr.as_ptr(), self.layout) },
+            MemoryOwner::Process => unsafe { dealloc(self.ptr.as_ptr(), self.layout) },
         }
     }
 }
@@ -1206,6 +1247,9 @@ type Made = (std::sync::Arc<HostTexture>, Option<std::sync::Arc<Twin>>);
 /// copy is the card's.
 #[cfg(windows)]
 struct Hosted {
+    /// A CPU pointer escaped through Map. It can be written between list
+    /// recording and submission, including while an older list is in flight.
+    cpu_mapped: std::sync::atomic::AtomicBool,
     /// The host copy (and twin) once made. Taken out again only by
     /// [`let_go_idle`] and when the title releases the resource.
     made: std::sync::Mutex<Option<Made>>,
@@ -2687,6 +2731,7 @@ fn hand_out_resource(
         backing,
         #[cfg(windows)]
         host: Hosted {
+            cpu_mapped: std::sync::atomic::AtomicBool::new(false),
             made: std::sync::Mutex::new(None),
             state,
             // SAFETY: the title passes a whole clear value (the format,
@@ -2719,7 +2764,10 @@ fn hand_out_resource(
     #[cfg(windows)]
     if desc.dimension == BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
-        crate::shadow::register(at, resource.data() as u64, desc.width);
+        // UPLOAD, READBACK, GPU_UPLOAD, and CPU-visible custom heaps.
+        let cpu_visible = matches!(heap.kind, 2 | 3 | 5)
+            || (heap.kind == 4 && matches!(heap.cpu_pages, 2 | 3));
+        crate::shadow::register_buffer(at, resource.data() as u64, desc.width, cpu_visible);
     }
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
 }
@@ -3157,10 +3205,20 @@ extern "system" fn resource_release(this: This) -> u32 {
 /// `out` only asks for residency.
 extern "system" fn map(this: This, _sub: u32, _read: *const c_void, out: *mut *mut u8) -> HRESULT {
     if !out.is_null() {
+        let r = resource(this);
+        #[cfg(windows)]
+        if fills(&r.desc) {
+            r.host.cpu_mapped.store(true, std::sync::atomic::Ordering::Release);
+        }
         // SAFETY: checked non-null; the title passes room for a pointer.
-        unsafe { out.write(resource(this).data()) };
+        unsafe { out.write(r.data()) };
     }
     S_OK
+}
+
+#[cfg(windows)]
+pub(crate) fn cpu_mapped(this: This) -> bool {
+    resource(this).host.cpu_mapped.load(std::sync::atomic::Ordering::Acquire)
 }
 extern "system" fn unmap(_: This, _sub: u32, _written: *const c_void) {}
 extern "system" fn resource_desc(this: This, out: *mut ResourceDesc) {
@@ -3213,7 +3271,7 @@ extern "system" fn gpu_address(this: This) -> u64 {
     if at >> 40 != 0 {
         static ONCE: [std::sync::Once; 2] = [std::sync::Once::new(), std::sync::Once::new()];
         let backing = match r.backing {
-            Backing::Committed(ref m) => format!("committed, attributes {:?}", m.attributes),
+            Backing::Committed(ref m) => format!("committed, owner {:?}", m.owner),
             Backing::Placed { offset, .. } => format!("placed in a heap at {offset:#x}"),
             Backing::Address(_) => "at a title address".into(),
         };
@@ -3602,6 +3660,91 @@ mod tests {
             assert_eq!(total, 24_072, "format {format}");
             assert!(subresource(&desc, 8).is_none(), "format {format}");
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cpu_visible_buffers_share_one_host_mirror() {
+        if crate::host::host().is_none() || std::env::var_os("VICTORY_CARD_ALL").is_some_and(|v| v == "1") {
+            return;
+        }
+        for (kind, cpu_pages) in [(2, 0), (3, 0), (5, 0), (4, 2), (4, 3)] {
+            let heap = HeapProperties { kind, cpu_pages, ..PROPERTIES };
+            let null = std::ptr::null();
+            let mut resource = null;
+            let desc = buffer(8 << 20);
+            assert_eq!(create_committed(null, &heap, 0, &desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut resource), S_OK);
+            let at = gpu_address(resource);
+            let shadow = crate::shadow::find(at, desc.width).unwrap();
+            assert!(!shadow.carded(), "a second mirror for heap type {kind}");
+            resource_release(resource);
+        }
+    }
+
+    /// The title maps its DEFAULT texture once, then changes the tiled bytes
+    /// after recording each list. The draw queue must see both versions.
+    #[cfg(windows)]
+    #[test]
+    fn persistent_default_texture_mapping_reaches_the_next_submission() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
+        let Some(host) = crate::host::host() else {
+            eprintln!("skipped texture readback: D3D12 device unavailable");
+            return;
+        };
+        let desc = texture(64, 32, 28, 1);
+        let layout = texture_layout(&desc).unwrap().planes.remove(0).layout;
+        let null = std::ptr::null();
+        let mut image = null;
+        assert_eq!(create_committed(null, &PROPERTIES, 0, &desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut image), S_OK);
+        let mut cpu = std::ptr::null_mut();
+        assert_eq!(map(image, 0, null.cast(), &mut cpu), S_OK);
+        let copy = host_copy(image).unwrap();
+        let back = host.read_back_buffer(8192).unwrap();
+        for generation in [1u8, 2, 3] {
+            let list = host.new_list().unwrap();
+            list.close();
+            list.reset();
+            crate::texture::upload(&list, image, &copy.texture);
+            crate::list::ensure_state(&list, image, 0x800);
+            let footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                Offset: 0,
+                Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                    Format: DXGI_FORMAT_R8G8B8A8_UNORM, Width: 64, Height: 32, Depth: 1, RowPitch: 256,
+                },
+            };
+            // SAFETY: resources live through synchronous execution. The
+            // mapped pointer addresses this texture's complete tiled layout.
+            unsafe {
+                let to = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&back),
+                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint },
+                };
+                let from = D3D12_TEXTURE_COPY_LOCATION {
+                    pResource: std::mem::transmute_copy(&copy.texture),
+                    Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+                };
+                list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+                list.close();
+                for y in 0..32 {
+                    for x in 0..64 {
+                        let at = layout.offset(0, x, y, 0).unwrap() as usize;
+                        cpu.add(at).cast::<[u8; 4]>().write([x as u8, y as u8, generation, 255]);
+                    }
+                }
+                host.execute(&[&list]);
+                let mut data = std::ptr::null_mut();
+                back.Map(0, None, Some(&mut data)).unwrap();
+                for (i, pixel) in std::slice::from_raw_parts(data.cast::<[u8; 4]>(), 64 * 32).iter().enumerate() {
+                    assert_eq!(*pixel, [(i % 64) as u8, (i / 64) as u8, generation, 255]);
+                }
+                back.Unmap(0, Some(&D3D12_RANGE::default()));
+            }
+        }
+        unmap(image, 0, null.cast());
+        resource_release(image);
     }
 
     /// A 4x4 texture filled from a title buffer through our list and queue,

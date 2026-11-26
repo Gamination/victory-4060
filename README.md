@@ -223,6 +223,22 @@ What is known to be wrong:
 
 ## How to run it
 
+### Dedicated GPU memory
+
+The title keeps CPU-writable console addresses. Sampled textures use a GPU-local
+host texture and a separate upload buffer. On a discrete adapter supporting
+GPU upload heaps, up to two 64 MiB texture upload blocks can use CPU-visible
+VRAM while at least 20% of the reported local budget remains free. The fallback
+uses system-RAM upload buffers. To compare the two paths on the same scene,
+pass `-More @{VICTORY_TEXTURE_BAR='0'}` to `scripts/play-nvidia.ps1`.
+
+The periodic sweep can release empty staging blocks after their submissions
+finish. It keeps up to 128 MiB of empty staging blocks and drops that allowance
+to zero below 2 GiB of available physical RAM. Live textures, buffers, and
+pending copies have separate lifetimes and can exceed those cache limits.
+
+### Build and launch
+
 You need Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader
 model 6.6 and mesh shaders, Rust (the toolchain is pinned), the MSVC build
 tools, and your own dump of the title.

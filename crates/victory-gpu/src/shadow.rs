@@ -4754,6 +4754,7 @@ mod land_tests {
 
 struct Entry {
     end: u64,
+    cpu_visible_heap: bool,
     shadow: Option<Arc<Shadow>>,
 }
 
@@ -4829,10 +4830,15 @@ fn buffers_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<(u64, usize), 
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
+    register_buffer(resource, start, len, false);
+}
+
+pub(crate) fn register_buffer(resource: usize, start: u64, len: u64, cpu_visible_heap: bool) {
     buffers().insert(
         (start, resource),
         Entry {
             end: start + len,
+            cpu_visible_heap,
             shadow: None,
         },
     );
@@ -4980,7 +4986,11 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // (`crate::inplace::place_for`): the buffer is the title's own
         // memory. Not the big ones `cards` puts in the card's memory: those
         // are read too often to stay in the PC's.
-        let big = cards() && (size >= card_limits().0 || card_all());
+        // CPU-visible heaps use a single mapped mirror. Raw-address shaders
+        // can also view this memory through UAV descriptors. The explicit
+        // two-sided synchronization override still applies to all buffers.
+        let separate_card_copy = !entry.cpu_visible_heap || card_all();
+        let big = separate_card_copy && cards() && (size >= card_limits().0 || card_all());
         if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
@@ -4989,7 +4999,8 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // A big one, with `cards`: shaders get a buffer in the card's own
         // memory, and the one just made is the CPU's side.
-        let (buffer, card) = match card_for(size) {
+        let on_card = if separate_card_copy { card_for(size) } else { None };
+        let (buffer, card) = match on_card {
             Some(on_card) => {
                 crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
                 tracing::info!(

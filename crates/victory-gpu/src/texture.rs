@@ -448,6 +448,12 @@ thread_local! {
 /// Calls `f` with `size` bytes of this thread's read buffer (their
 /// contents are whatever the last texture left).
 fn with_read<R>(size: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
+    // Streaming one large texture must not pin its scratch space on every
+    // submitting thread for the rest of the run.
+    const CACHED: usize = 8 << 20;
+    if size > CACHED {
+        return f(&mut vec![0; size]);
+    }
     READ.with(|read| {
         let mut read = read.borrow_mut();
         if read.len() < size {
@@ -533,7 +539,10 @@ pub(crate) fn let_go_idle() {
     if map.is_empty() {
         return;
     }
-    let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+    let mut idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+    if STAGED[1].load(Relaxed) > 256 << 20 {
+        idle_ms = idle_ms.min(10_000);
+    }
     // A list that recorded an upload or a check holds the staging until it
     // is reset: one only the table holds is named by no list, recorded or
     // running.
@@ -771,7 +780,8 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     };
     use std::sync::atomic::Ordering::Relaxed;
     let picking = PICKING.get();
-    if picking.is_none() {
+    let mapped = crate::resource::cpu_mapped(resource);
+    if picking.is_none() || mapped {
         // A draw samples it through a table: kept and checked from here on.
         staging.once.store(false, Relaxed);
     }
@@ -814,7 +824,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, first: u32) {
     // ghosts and pictures from earlier (r_avm23, the user's recording).
     // With the copy recorded here, it takes what that check puts in the
     // staging buffer at this list's submission.
-    if staging.guard_view && staging.uploaded.load(Relaxed) && !staging.dirty.load(Relaxed) {
+    if !mapped && staging.guard_view && staging.uploaded.load(Relaxed) && !staging.dirty.load(Relaxed) {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexSkipped, 1);
         list.defer_texture(staging);
@@ -1782,6 +1792,9 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
     if let Some(s) = map.get(&(resource as usize))
         && s.first <= first.max(copy.base)
         && s.serial == copy.serial
+        // Each list must be able to refresh an exposed texture right up to
+        // submission without changing an older list's pending copy source.
+        && (!crate::resource::cpu_mapped(resource) || Arc::strong_count(s) == 1)
     {
         return Some(s.clone());
     }
@@ -1853,6 +1866,9 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
             None,
             Some(&mut total),
         );
+    }
+    if total == 0 || total == u64::MAX {
+        return None;
     }
     let (piece, buffer, base, data) = match crate::pool::staging(host, total) {
         Some((piece, buffer, base, data)) => (Some(piece), buffer, base, data),
