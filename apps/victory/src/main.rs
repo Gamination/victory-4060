@@ -5,6 +5,8 @@
 
 mod census;
 mod inspect;
+#[cfg(windows)]
+mod precompile;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod replay;
 mod run;
@@ -104,6 +106,48 @@ enum Command {
         /// Worker threads (default: every logical core).
         #[arg(long)]
         jobs: Option<usize>,
+    },
+    /// Translate every shader of the title into the cache and make the host
+    /// pipelines earlier runs drew with, before a run, so that a place seen
+    /// for the first time is not slow while they are made. Once per change
+    /// of the translator, of its settings or of the driver; goes on where it
+    /// was stopped. The launchers run it with `--if-needed` at every launch.
+    #[cfg(windows)]
+    Precompile {
+        /// The title's files (default: the configured game directory).
+        paths: Vec<PathBuf>,
+        /// Shader threads (default: every logical core); pipeline processes
+        /// (default: two thirds of them).
+        #[arg(long)]
+        jobs: Option<usize>,
+        /// Translate the shaders only: make no host pipelines.
+        #[arg(long)]
+        shaders_only: bool,
+        /// Every pipeline earlier runs created, not only those they drew with
+        /// (most of the title's 84,000 are made while it loads, never drawn).
+        #[arg(long)]
+        all: bool,
+        /// At most this many pipelines.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Those made before too.
+        #[arg(long)]
+        again: bool,
+        /// Write the translated shaders into this file as well, one file that
+        /// --load puts back (default: precompiled.vpc, beside the cache
+        /// folder).
+        #[arg(long, value_name = "FILE", num_args = 0..=1, require_equals = true)]
+        save: Option<Option<PathBuf>>,
+        /// Put the shaders of this file into the cache before translating
+        /// (default: precompiled.vpc, beside the cache folder; nothing there
+        /// is not an error).
+        #[arg(long, value_name = "FILE", num_args = 0..=1, require_equals = true)]
+        load: Option<Option<PathBuf>>,
+        /// Do nothing when the last precompile saw this build, these settings,
+        /// these files and this cache: no walk of the title (what a launch
+        /// does; the pipelines are warmed either way).
+        #[arg(long)]
+        if_needed: bool,
     },
     /// Make the host pipelines of every pipeline the title ever created
     /// (runs with `VICTORY_PIPELINE_BOOK=1` write them down), so that the
@@ -213,7 +257,31 @@ fn main() -> Result<()> {
             }
             translate::run(paths, validate, pipelines, list, jobs)
         }
-        Command::Shaders { paths, jobs } => translate::precompile(paths, jobs),
+        Command::Shaders { paths, jobs } => {
+            translate::precompile(paths, jobs).map(|done| done.report())
+        }
+        #[cfg(windows)]
+        Command::Precompile {
+            paths,
+            jobs,
+            shaders_only,
+            all,
+            limit,
+            again,
+            save,
+            load,
+            if_needed,
+        } => precompile::run(precompile::Options {
+            paths,
+            jobs,
+            shaders_only,
+            all,
+            limit,
+            again,
+            save,
+            load,
+            if_needed,
+        }),
         #[cfg(windows)]
         Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
         Command::Run {

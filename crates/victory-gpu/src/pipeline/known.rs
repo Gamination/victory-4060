@@ -188,6 +188,52 @@ pub fn count(dir: &Path) -> usize {
     n
 }
 
+/// The shaders earlier runs recorded in `dir` (runs with
+/// `VICTORY_PIPELINE_BOOK=1`), read at their places from any thread: every
+/// one a pipeline names, which a scan of the title's files need not find
+/// (they may sit in archives `sources` cannot open).
+pub struct Recorded {
+    file: std::fs::File,
+    /// Stage, hash, place and length of each (`walk_shaders`).
+    places: Vec<(u8, [u8; 32], u64, u32)>,
+}
+
+impl Recorded {
+    /// Those of `dir`; `None` when no run has recorded any.
+    pub fn open(dir: &Path) -> Option<Self> {
+        let file = std::fs::File::open(dir.join(SHADERS)).ok()?;
+        let mut places = Vec::new();
+        walk_shaders(dir, |stage, hash, at, len| places.push((stage, hash, at, len)));
+        (!places.is_empty()).then_some(Recorded { file, places })
+    }
+
+    /// How many there are.
+    pub fn len(&self) -> usize {
+        self.places.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.places.is_empty()
+    }
+
+    /// One of them: its stage, hash and container.
+    pub fn read(&self, n: usize) -> Option<(u8, [u8; 32], Vec<u8>)> {
+        use std::os::windows::fs::FileExt;
+        let &(stage, hash, at, len) = self.places.get(n)?;
+        let mut bytes = vec![0; len as usize];
+        let mut read = 0;
+        while read < bytes.len() {
+            // (`seek_read` reads some, not all: it goes on where it stopped.)
+            let n = self.file.seek_read(&mut bytes[read..], at + read as u64).ok()?;
+            if n == 0 {
+                return None;
+            }
+            read += n;
+        }
+        Some((stage, hash, bytes))
+    }
+}
+
 /// The key of each pipeline known in `dir`, as the early list has it.
 pub fn keys(dir: &Path) -> Vec<String> {
     let mut all = Vec::new();
@@ -476,5 +522,32 @@ mod tests {
         assert_eq!(walk_shaders(&dir, |stage, hash, at, len| seen.push((stage, hash[0], at, len))), one);
         assert_eq!(seen, [(5, 9, 37, 4)]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recorded_shaders_are_read_at_their_places() {
+        let dir = std::env::temp_dir().join(format!("victory-recorded-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut bytes = Vec::new();
+        for (stage, body) in [(3u8, [1u8, 2, 3].as_slice()), (5, [7, 8].as_slice())] {
+            bytes.push(stage);
+            bytes.extend([stage; 32]);
+            bytes.extend((body.len() as u32).to_le_bytes());
+            bytes.extend(body);
+        }
+        // (A torn one at the end is not one.)
+        bytes.extend([9; 5]);
+        std::fs::write(dir.join(SHADERS), &bytes).unwrap();
+        let recorded = Recorded::open(&dir).expect("two are whole");
+        assert_eq!(recorded.len(), 2);
+        assert!(!recorded.is_empty());
+        let (stage, hash, body) = recorded.read(1).expect("the second");
+        assert_eq!(stage, 5);
+        assert_eq!(hash, [5; 32]);
+        assert_eq!(body, vec![7, 8]);
+        assert!(recorded.read(2).is_none());
+        assert!(recorded.read(0).is_some_and(|(stage, ..)| stage == 3));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(Recorded::open(&dir).is_none());
     }
 }

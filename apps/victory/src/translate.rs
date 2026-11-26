@@ -393,18 +393,96 @@ pub fn run(
     Ok(())
 }
 
-/// Every shader found into the cache runs translate from.
-pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>) -> Result<()> {
+/// A set of containers translated into the shader cache: what was done,
+/// and why others were not.
+pub struct Precompiled {
+    /// Translated now, and found in the cache already.
+    pub translated: usize,
+    pub cached: usize,
+    /// Reason → containers, and the first of each.
+    pub failed: BTreeMap<String, (usize, String)>,
+    pub seconds: f64,
+}
+
+impl Precompiled {
+    pub fn report(&self) {
+        let sum = self.failed.values().map(|f| f.0).sum::<usize>();
+        println!(
+            "shaders      {} in the cache ({} translated now, {} already there), \
+             {sum} do not translate, {:.0} s",
+            self.translated + self.cached,
+            self.translated,
+            self.cached,
+            self.seconds
+        );
+        for (why, (n, hash)) in &self.failed {
+            println!("  {n:>5}  {why}  (e.g. {hash})");
+        }
+    }
+}
+
+/// The shader cache as `precompile`'s threads fill it.
+#[derive(Default)]
+struct Warming {
+    /// Containers handed over already: the same one is in many files, and
+    /// again in the pipeline book.
+    seen: Mutex<HashSet<blake3::Hash>>,
+    translated: AtomicUsize,
+    cached: AtomicUsize,
+    failed: Mutex<BTreeMap<String, (usize, String)>>,
+}
+
+impl Warming {
+    fn one(&self, bytes: &[u8], began: std::time::Instant) {
+        let hash = blake3::hash(bytes);
+        if !lock(&self.seen).insert(hash) {
+            return;
+        }
+        match victory_hle::modules::d3d12x::precompile(bytes) {
+            Ok(true) => {
+                self.cached.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(false) => {
+                let n = self.translated.fetch_add(1, Ordering::Relaxed) + 1;
+                if n.is_multiple_of(1000) {
+                    println!("{n} shaders translated, {:.0} s", began.elapsed().as_secs_f64());
+                }
+            }
+            Err(why) => {
+                let mut failed = lock(&self.failed);
+                failed
+                    .entry(why)
+                    .or_insert_with(|| (0, hash.to_hex()[..16].to_owned()))
+                    .0 += 1;
+            }
+        }
+    }
+}
+
+/// Translates every shader found under `paths`, and every one earlier runs
+/// recorded in the pipeline book (which holds the ones inside archives a
+/// scan cannot open), into the shader cache: a run then translates none of
+/// them at the draw that first wants it.
+pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>) -> Result<Precompiled> {
     let cfg = victory_core::Config::load()?;
-    victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
+    let shaders = cfg.cache_subdir("shaders")?;
+    victory_hle::modules::d3d12x::use_shader_cache(shaders.clone());
     let paths = crate::default_paths(paths)?;
-    let threads =
-        jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
-    let started = std::time::Instant::now();
-    let seen = Mutex::new(HashSet::new());
-    let done = AtomicUsize::new(0);
-    let failed = Mutex::new(BTreeMap::<String, (usize, String)>::new());
+    let threads = jobs
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()))
+        .max(1);
+    let began = std::time::Instant::now();
+    let warming = Warming::default();
+    warm_recorded(
+        &shaders.with_file_name("pipelines"),
+        threads,
+        &warming,
+        began,
+    );
     for root in &paths {
+        // (The scan reads every file: minutes on a large install, once per
+        // cache. The line says what the long wait is.)
+        println!("shaders      reading {}", root.display());
         for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
             if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
                 continue;
@@ -418,22 +496,8 @@ pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>) -> Result<()> {
                 for _ in 0..threads.min(jobs.len()) {
                     s.spawn(|| {
                         while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
-                            let Some(bytes) = job.bytes() else { continue };
-                            let hash = blake3::hash(&bytes);
-                            if !lock(&seen).insert(hash) {
-                                continue;
-                            }
-                            match victory_hle::modules::d3d12x::precompile(&bytes) {
-                                Ok(_) => {
-                                    let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-                                    if n.is_multiple_of(1000) {
-                                        println!("{n} shaders in the cache, {:.0} s", started.elapsed().as_secs_f64());
-                                    }
-                                }
-                                Err(why) => {
-                                    let mut failed = lock(&failed);
-                                    failed.entry(why).or_insert_with(|| (0, hash.to_hex()[..16].to_owned())).0 += 1;
-                                }
+                            if let Some(bytes) = job.bytes() {
+                                warming.one(&bytes, began);
                             }
                         }
                     });
@@ -441,18 +505,46 @@ pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>) -> Result<()> {
             });
         }
     }
-    let failed = failed.into_inner().unwrap_or_else(|e| e.into_inner());
-    println!(
-        "{} shaders in the cache, {} do not translate, {:.0} s",
-        done.load(Ordering::Relaxed),
-        failed.values().map(|f| f.0).sum::<usize>(),
-        started.elapsed().as_secs_f64()
-    );
-    for (why, (n, hash)) in failed {
-        println!("  {n:>5}  {why}  (e.g. {hash})");
-    }
-    Ok(())
+    let failed = std::mem::take(&mut *lock(&warming.failed));
+    Ok(Precompiled {
+        translated: warming.translated.load(Ordering::Relaxed),
+        cached: warming.cached.load(Ordering::Relaxed),
+        failed,
+        seconds: began.elapsed().as_secs_f64(),
+    })
 }
+
+/// Those of the pipeline book (`VICTORY_PIPELINE_BOOK=1` wrote it): the
+/// shaders the title itself handed over in earlier runs.
+#[cfg(windows)]
+fn warm_recorded(dir: &Path, threads: usize, warming: &Warming, began: std::time::Instant) {
+    let Some(recorded) = victory_hle::known_pipelines::Recorded::open(dir) else {
+        return;
+    };
+    println!(
+        "shaders      {} of them earlier runs recorded (the title's own), in the cache first",
+        recorded.len()
+    );
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for _ in 0..threads.min(recorded.len()) {
+            s.spawn(|| {
+                loop {
+                    let n = next.fetch_add(1, Ordering::Relaxed);
+                    if n >= recorded.len() {
+                        break;
+                    }
+                    if let Some((_, _, bytes)) = recorded.read(n) {
+                        warming.one(&bytes, began);
+                    }
+                }
+            });
+        }
+    });
+}
+
+#[cfg(not(windows))]
+fn warm_recorded(_: &Path, _: usize, _: &Warming, _: std::time::Instant) {}
 
 fn translate(
     source: &Source,

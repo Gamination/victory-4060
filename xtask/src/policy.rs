@@ -14,8 +14,10 @@ use anyhow::{Context, Result, bail};
 const MAX_FILE_SIZE: usize = 640 * 1024;
 const MAX_ENCODED_RUN: usize = 512;
 
+// (`bat`: the Windows launchers are batch files, like the `cmd` ones.)
 const ALLOWED_EXTENSIONS: &[&str] = &[
-    "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "sh",
+    "rs", "toml", "md", "txt", "lock", "yml", "yaml", "json", "hlsl", "hlsli", "ps1", "cmd", "bat",
+    "sh",
 ];
 const ALLOWED_NAMES: &[&str] = &[
     ".gitignore",
