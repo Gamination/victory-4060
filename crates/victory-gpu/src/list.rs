@@ -205,6 +205,23 @@ impl Detached {
     }
 }
 
+/// LOCAL (n23, ghosting): flights that have landed give their dynamic
+/// descriptor slots back at once. The card is done with them, and only the
+/// card reads them; the host lists and upload memory still wait
+/// `VICTORY_BURY_LAG` flights ([`recycle`]). Held with them, the slots
+/// stayed ~5 frames and a busy outdoor frame (~94k slots) ran the 524,288
+/// out: ~3k tables refused a frame, their draws dropped (n22).
+/// `VICTORY_SLOTS_AT_LANDING=0`: kept with the lists, as before.
+#[cfg(windows)]
+pub(crate) fn slots_done(lists: &mut [Detached]) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("VICTORY_SLOTS_AT_LANDING").is_none_or(|v| v != "0")) {
+        for list in lists {
+            list._state.tables_done();
+        }
+    }
+}
+
 /// A host list that has run and waits to be used again, and the bytes of
 /// upload memory it keeps.
 #[cfg(windows)]

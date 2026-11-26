@@ -610,16 +610,24 @@ pub(crate) fn with_heap<T>(heap: usize, f: impl FnOnce(&Heap) -> T) -> Option<T>
     heaps.iter().any(|&(_, _, h)| h == heap).then(|| f(unsafe { &*(heap as *const Heap) }))
 }
 
-/// Gives back dynamic slots of the host heap behind the title heap at
-/// `heap`, if that heap still exists.
+/// Gives back the dynamic slots `held` (title heap, first, count) of the
+/// host heaps behind title heaps that still exist, each heap's lock taken
+/// once.
 #[cfg(windows)]
-pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
+pub(crate) fn release_dynamic(held: &[(usize, u32, u32)]) {
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
-    if heaps.iter().any(|&(_, _, h)| h == heap)
-        // SAFETY: registered heaps are live (removed when dropped).
-        && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
-    {
-        host.release(first, n);
+    let mut done: Vec<usize> = Vec::new();
+    for &(heap, _, _) in held {
+        if done.contains(&heap) {
+            continue;
+        }
+        done.push(heap);
+        if heaps.iter().any(|&(_, _, h)| h == heap)
+            // SAFETY: registered heaps are live (removed when dropped).
+            && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
+        {
+            host.release_runs(held.iter().filter(|r| r.0 == heap).map(|r| (r.1, r.2)));
+        }
     }
 }
 
@@ -1640,13 +1648,15 @@ mod tests {
             user_data: 4,
             slot: 1,
         };
-        let made = state.tables(&list, &[range], &[], &[(1, 8)], true);
+        let made = state.tables(&list, &[range], &[], &[(1, 8)], true, (&[], &mut Vec::new()));
         let [(1, offset)] = made[..] else {
             panic!("one fresh table for root parameter 1, not {:?}", &made[..]);
         };
         assert_ne!(offset, u32::MAX, "the table found no dynamic slots");
-        let next = host_heap.dynamic(1).expect("a dynamic slot");
-        host_heap.release(next, 1);
+        // (Through the list, which may cut it from the block it holds.)
+        let next = state
+            .slots(std::ptr::from_ref(title) as usize, host_heap, 1)
+            .expect("a dynamic slot");
         drop(state);
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
         assert_eq!(

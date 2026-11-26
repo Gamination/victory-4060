@@ -919,6 +919,12 @@ extern "system" fn present(
     #[cfg(all(windows, feature = "diagnostics"))]
     {
         crate::capture::frame_drew(frame, crate::draw::drawn());
+        // LOCAL (n22): how long the dynamic descriptor slots stay held.
+        if frame % 30 == 0
+            && let Some(ages) = crate::descriptor::with_view_heap(|h| h.held_ages(frame as u32))
+        {
+            tracing::info!(target: "victory_gpu::host", ?ages, "dynamic slots held, by frames since taken: 0,1,2,3,4,5-8,9-32,more");
+        }
         if crate::capture::listed(frame) {
             before_sync();
             crate::capture::dump_targets(frame);

@@ -157,7 +157,11 @@ pub(crate) struct HostHeap {
     kept: Box<[Mutex<Option<ID3D12Resource>>]>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
-    next: Mutex<(u32, Vec<bool>)>,
+    next: Mutex<(u32, Taken)>,
+    /// LOCAL (n22, diagnostics): per dynamic slot, the frame (`presented`)
+    /// it was last taken in, for [`HostHeap::held_ages`].
+    #[cfg(feature = "diagnostics")]
+    taken_at: Box<[std::sync::atomic::AtomicU32]>,
     /// How many dynamic slots are free (changed under `next`'s lock): with
     /// fewer than a table needs, the search is not made. Once the world
     /// had taken them all, every later table of the frame searched every
@@ -1283,7 +1287,7 @@ pub(crate) fn slot_story(slot: u32) -> String {
         let mut text = if index < host.count {
             format!("title slot {index}, made from {}", host.describe_slot(index).unwrap_or_default())
         } else {
-            let taken = host.next.lock().unwrap_or_else(|e| e.into_inner()).1.get((index - host.count) as usize).copied();
+            let taken = host.next.lock().unwrap_or_else(|e| e.into_inner()).1.get((index - host.count) as usize);
             format!("dynamic slot {} (taken {taken:?})", index - host.count)
         };
         if twin {
@@ -1586,7 +1590,9 @@ impl HostHeap {
             waiting: Mutex::default(),
             away: Mutex::default(),
             kept: (0..count + extra).map(|_| Mutex::new(None)).collect(),
-            next: Mutex::new((0, vec![false; extra as usize])),
+            next: Mutex::new((0, Taken::new(extra as usize))),
+            #[cfg(feature = "diagnostics")]
+            taken_at: (0..extra).map(|_| std::sync::atomic::AtomicU32::new(0)).collect(),
             free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
@@ -1690,6 +1696,65 @@ fn null_sampler(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     unsafe { host.device.CreateSampler(&desc, at) };
 }
 
+/// Which dynamic slots are taken, a bit each. LOCAL (n11): searched a
+/// `bool` at a time, the recording threads spent 164-259 ms a frame in
+/// `dynamic`, under the lock they all take; this skips a word of 64 at a
+/// time, with the same first-fit answer.
+pub(crate) struct Taken(Vec<u64>);
+
+impl Taken {
+    fn new(n: usize) -> Self {
+        Taken(vec![0; n.div_ceil(64)])
+    }
+
+    fn get(&self, at: usize) -> Option<bool> {
+        self.0.get(at / 64).map(|w| w >> (at % 64) & 1 != 0)
+    }
+
+    /// Marks `[from, to)` taken.
+    fn set(&mut self, from: usize, to: usize) {
+        for at in from..to {
+            self.0[at / 64] |= 1 << (at % 64);
+        }
+    }
+
+    /// Marks `[from, to)` free: how many of them were taken.
+    fn clear(&mut self, from: usize, to: usize) -> usize {
+        let mut given = 0;
+        for at in from..to {
+            let (w, bit) = (at / 64, 1u64 << (at % 64));
+            given += usize::from(self.0[w] & bit != 0);
+            self.0[w] &= !bit;
+        }
+        given
+    }
+
+    /// The first of `n` free slots in a row within `[from, to)`.
+    fn free_run(&self, from: usize, to: usize, n: usize) -> Option<usize> {
+        let (mut at, mut run) = (from, 0);
+        while at < to {
+            let (w, b) = (at / 64, at % 64);
+            let span = (64 - b).min(to - at);
+            let mask = if span == 64 { u64::MAX } else { (1u64 << span) - 1 };
+            let word = (self.0[w] >> b) & mask;
+            // Free bits at the low end, then taken ones.
+            let free = (word.trailing_zeros() as usize).min(span);
+            if run + free >= n {
+                return Some(at - run);
+            }
+            if free == span {
+                run += span;
+                at += span;
+                continue;
+            }
+            let held = ((word >> free).trailing_ones() as usize).min(span - free);
+            run = 0;
+            at += free + held;
+        }
+        None
+    }
+}
+
 impl HostHeap {
     /// `n` consecutive free dynamic slots (view heaps only), taken until
     /// [`HostHeap::release`]: the first's index.
@@ -1707,30 +1772,23 @@ impl HostHeap {
             && n < self.too_long.load(std::sync::atomic::Ordering::Relaxed);
         let n = n as usize;
         // Search from `next` on, then from the start (extending past cursor by
-        // n - 1 so contiguous runs crossing the cursor are not missed).
+        // n - 1 so contiguous runs crossing the cursor are not missed). A run
+        // cannot wrap past the end.
         let cursor = *next as usize;
         let end = self.dynamic as usize;
         let second_end = cursor.saturating_add(n.saturating_sub(1)).min(end);
-        let starts = (cursor..end).chain(0..second_end);
-        let mut run = 0;
-        let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts.take(if enough { usize::MAX } else { 0 }) {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
-            }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
-            }
-        }
+        let found = enough
+            .then(|| taken.free_run(cursor, end, n).or_else(|| taken.free_run(0, second_end, n)))
+            .flatten();
         let Some(first) = found else {
             if enough {
                 self.too_long.fetch_min(n as u32, std::sync::atomic::Ordering::Relaxed);
             }
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(
+                crate::copystat::C::DynamicFreeAtRefusal,
+                u64::from(self.free.load(std::sync::atomic::Ordering::Relaxed)),
+            );
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
             #[cfg(feature = "diagnostics")]
@@ -1743,10 +1801,37 @@ impl HostHeap {
         };
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
-        taken[first..first + n].fill(true);
+        taken.set(first, first + n);
+        #[cfg(feature = "diagnostics")]
+        {
+            let now = crate::queue::presented() as u32;
+            for at in &self.taken_at[first..first + n] {
+                at.store(now, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::DynamicSlots, n as u64);
         self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
         *next = ((first + n) % end) as u32;
         Some(self.count + first as u32)
+    }
+
+    /// LOCAL (n22, diagnostics): the dynamic slots taken now, by how many
+    /// frames ago they were taken: 0, 1, 2, 3, 4, 5-8, 9-32, more.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn held_ages(&self, now: u32) -> [u32; 8] {
+        let guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ages = [0u32; 8];
+        for (w, &word) in guard.1.0.iter().enumerate() {
+            let mut bits = word;
+            while bits != 0 {
+                let at = w * 64 + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let age = now.wrapping_sub(self.taken_at[at].load(std::sync::atomic::Ordering::Relaxed));
+                ages[match age { 0..=4 => age as usize, 5..=8 => 5, 9..=32 => 6, _ => 7 }] += 1;
+            }
+        }
+        ages
     }
 
     /// The title slots this heap has host slots for; fewer than the title's
@@ -2581,16 +2666,29 @@ impl HostHeap {
     ///
     /// [`dynamic`]: HostHeap::dynamic
     pub(crate) fn release(&self, first: u32, n: u32) {
-        let Some(at) = first.checked_sub(self.count) else {
-            return;
-        };
+        self.release_runs([(first, n)]);
+    }
+
+    /// As [`HostHeap::release`] for many runs under one taking of the lock.
+    /// LOCAL (n7): a list gave its ~28,000 tables a frame back one lock
+    /// each, and each reset `too_long`, so the next refused table searched
+    /// the whole pool again; the recording threads spent about half their
+    /// working time waiting on this lock with the pool full.
+    pub(crate) fn release_runs(&self, runs: impl IntoIterator<Item = (u32, u32)>) {
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let end = (at + n).min(self.dynamic) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
-            let given = slots.iter().filter(|taken| **taken).count() as u32;
+        let mut given = 0u32;
+        for (first, n) in runs {
+            let Some(at) = first.checked_sub(self.count) else {
+                continue;
+            };
+            let end = at.saturating_add(n).min(self.dynamic) as usize;
+            if (at as usize) < end {
+                given += guard.1.clear(at as usize, end) as u32;
+            }
+        }
+        if given > 0 {
             self.free.fetch_add(given, std::sync::atomic::Ordering::Relaxed);
             self.too_long.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
-            slots.fill(false);
         }
     }
 
@@ -5802,6 +5900,38 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
     }
 
     #[test]
+    fn taken_slots_find_the_first_free_run_by_words() {
+        let mut t = Taken::new(200);
+        assert_eq!(t.free_run(0, 200, 200), Some(0));
+        t.set(0, 70);
+        t.set(100, 101);
+        assert_eq!(t.get(69), Some(true));
+        assert_eq!(t.get(70), Some(false));
+        // 70..100 is 30 free; 101..200 is 99.
+        assert_eq!(t.free_run(0, 200, 30), Some(70));
+        assert_eq!(t.free_run(0, 200, 31), Some(101));
+        assert_eq!(t.free_run(0, 200, 99), Some(101));
+        assert_eq!(t.free_run(0, 200, 100), None);
+        // Bounded by `to`, and starting mid-run.
+        assert_eq!(t.free_run(75, 100, 25), Some(75));
+        assert_eq!(t.free_run(75, 99, 25), None);
+        assert_eq!(t.free_run(0, 0, 1), None);
+        assert_eq!(t.clear(60, 80), 10);
+        assert_eq!(t.free_run(0, 200, 40), Some(60));
+        // Against the slot-by-slot search, on a pattern.
+        let mut t = Taken::new(300);
+        for at in (0..300).filter(|at| (at * 7 + at / 13) % 5 == 0 || at % 41 < 9) {
+            t.set(at, at + 1);
+        }
+        for n in 1..20 {
+            for from in [0, 1, 63, 64, 65, 130] {
+                let slow = (from..300).find(|&s| s + n <= 300 && (s..s + n).all(|a| t.get(a) == Some(false)));
+                assert_eq!(t.free_run(from, 300, n), slow, "n {n} from {from}");
+            }
+        }
+    }
+
+    #[test]
     fn dynamic_search_can_find_a_run_across_the_cursor() {
         let Some(heap) = HostHeap::new(false, 4) else {
             eprintln!("no host descriptor heap; skipped");
@@ -5816,8 +5946,9 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
         // Reallocating the left half puts the cursor back in the middle.
         heap.release(left, 2);
         assert_eq!(heap.dynamic(2), Some(left));
-        heap.release(left, 2);
-        heap.release(right, 2);
+        // Both runs given back under one lock (and a slot that is no
+        // dynamic one skipped).
+        heap.release_runs([(left, 2), (0, 1), (right, 2)]);
         assert_eq!(heap.dynamic(4), Some(left));
         assert_eq!(heap.dynamic(1), None);
 

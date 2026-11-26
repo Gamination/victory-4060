@@ -344,6 +344,9 @@ pub(crate) struct State {
     /// The dynamic slots the list holds: title heap, first, count; given
     /// back when the list has run, is reset or released.
     dynamic: Vec<(usize, u32, u32)>,
+    /// The block small asks are cut from ([`State::slots`]): title heap
+    /// (0: none), next free slot, end.
+    chunk: (usize, u32, u32),
     /// Root SRVs bound as one-view tables in this list: (title heap, title
     /// address; 0 for none) → dynamic slot, and the host copy the slot
     /// shows: later draws of the list bring that one up to date, whatever
@@ -360,10 +363,60 @@ pub(crate) struct State {
 
 impl Drop for State {
     fn drop(&mut self) {
-        for &(heap, first, n) in &self.dynamic {
-            crate::descriptor::release_dynamic(heap, first, n);
+        crate::descriptor::release_dynamic(&self.dynamic);
+    }
+}
+
+/// Whether the stages of one draw share a table they both need made afresh
+/// (`VICTORY_TABLE_STAGES=1`; off by default). After fxceless 5d659e0: the
+/// slot count is in the key of `State::fresh_tables`, so a mesh stage and a
+/// pixel stage that read one table to different depths made it twice, each
+/// in dynamic slots of its own. With this both ask for the larger count
+/// ([`stage_spans`]) and the second finds the first one's table (their
+/// estimate on a heavy frame: 24 % fewer slots). LOCAL (n7): on NVIDIA's
+/// capped heap the slots ran out outdoors, 2,500 draws a frame dropped.
+fn table_stages() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TABLE_STAGES").is_some_and(|v| v == "1"))
+}
+
+/// The dynamic slots a list takes at once for its small tables
+/// (`VICTORY_SLOT_CHUNK`; default 0: each table its own run). LOCAL (n13):
+/// at 64, tables refused for no slots went from ~290 to ~2,100 a frame
+/// (n12 → n13), with 10,000-29,000 slots free at a refusal: an experiment
+/// that failed, kept for a smaller block size.
+fn slot_chunk() -> u32 {
+    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_SLOT_CHUNK").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+    })
+}
+
+/// For [`table_stages`]: per root table the stages of `p` read, the slots it
+/// has up to the last entry read by a stage that also reads a constant view
+/// in it (0: no stage does), and up to the last entry any stage reads:
+/// (root parameter, with constants, all).
+fn stage_spans(p: &HostPipeline) -> Vec<(u8, u32, u32)> {
+    let mut spans: Vec<(u8, u32, u32)> = Vec::new();
+    for stage in &p.stages {
+        let t = stage.translated();
+        let mut constant = [false; 256];
+        for u in t.used.iter().filter(|u| u.root == RootType::Table && u.kind == ResourceType::Cbv) {
+            constant[usize::from(u.slot)] = true;
+        }
+        for u in t.used.iter().filter(|u| u.root == RootType::Table) {
+            let n = u.table_offset_dwords / 8 + 1;
+            let with = if constant[usize::from(u.slot)] { n } else { 0 };
+            match spans.iter_mut().find(|s| s.0 == u.slot) {
+                Some(s) => {
+                    s.1 = s.1.max(with);
+                    s.2 = s.2.max(n);
+                }
+                None => spans.push((u.slot, with, n)),
+            }
         }
     }
+    spans
 }
 
 impl State {
@@ -382,14 +435,43 @@ impl State {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!("a list ran again after its descriptor tables were given back"));
         }
-        for (heap, first, n) in self.dynamic.drain(..) {
-            crate::descriptor::release_dynamic(heap, first, n);
-        }
+        crate::descriptor::release_dynamic(&self.dynamic);
+        self.dynamic.clear();
+        self.chunk = (0, 0, 0);
         self.fresh_tables.clear();
         self.recording = 0;
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
         self.tables_gone = true;
+    }
+
+    /// `n` dynamic slots of `host` (the host heap of title heap `heap`),
+    /// held until the list's slots are given back. LOCAL (n12): tables of ~5
+    /// slots, each taken from the shared pool on its own and given back
+    /// list by list, left the pool in pieces: 48-940 tables a frame were
+    /// refused with 3,000-36,000 slots free. An ask of up to half a
+    /// [`slot_chunk`] is cut from a block the list takes whole, so the pool
+    /// mostly sees runs of one size; with no block to be had it takes the
+    /// exact count. A list wastes at most a block's tail (256 lists in the
+    /// air: ~16,000 of 262,144 slots at 64).
+    pub(crate) fn slots(&mut self, heap: usize, host: &crate::descriptor::host::HostHeap, n: u32) -> Option<u32> {
+        let chunk = slot_chunk();
+        let (h, next, end) = self.chunk;
+        if n > 0 && h == heap && n <= end - next {
+            self.chunk.1 += n;
+            return Some(next);
+        }
+        if n > 0
+            && n <= chunk / 2
+            && let Some(first) = host.dynamic(chunk)
+        {
+            self.dynamic.push((heap, first, chunk));
+            self.chunk = (heap, first + n, first + chunk);
+            return Some(first);
+        }
+        let first = host.dynamic(n)?;
+        self.dynamic.push((heap, first, n));
+        Some(first)
     }
 }
 
@@ -1501,6 +1583,11 @@ impl State {
             // The title may release the pipeline before it submits the list.
             list.bind_pipeline(&p.name, &p.pso, &p.root);
         }
+        // With `table_stages`: what the stages of this draw read of each
+        // table, and the tables its earlier stages made afresh (address,
+        // slots).
+        let spans = if p.stages.len() > 1 && table_stages() { stage_spans(p) } else { Vec::new() };
+        let mut staged: Vec<(u64, u32)> = Vec::new();
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
@@ -1513,10 +1600,14 @@ impl State {
                 &t.host.root_indexed_views,
                 &t.host.half_views,
                 compute,
+                (&spans, &mut staged),
             );
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
+                // How many a frame, in the frame line's list of drops.
+                #[cfg(feature = "diagnostics")]
+                crate::pipeline::note_why(format!("no free dynamic slots for a table: {}", p.name));
                 return false;
             }
             if stage.shader.ambient.is_some() {
@@ -1733,12 +1824,14 @@ impl State {
             }
             Some(s)
         };
+        #[cfg(feature = "diagnostics")]
+        let pipeline = self.pipeline;
         let ready = |a: u64, s: &std::sync::Arc<crate::shadow::Shadow>| {
             let len = s.left(a).min(limit);
             s.refresh(list, a, len);
             if writes {
                 #[cfg(feature = "diagnostics")]
-                crate::host::wide_write(a, len, self.pipeline);
+                crate::host::wide_write(a, len, pipeline);
                 s.gpu_writes(list, a, len);
             }
         };
@@ -1775,10 +1868,9 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
-                let Some(index) = host.dynamic(1) else {
+                let Some(index) = self.slots(key.0, host, 1) else {
                     return false;
                 };
-                self.dynamic.push((key.0, index, 1));
                 if let Some((a, s)) = &shadow {
                     // SAFETY: a live buffer.
                     let base = unsafe { s.buffer.GetGPUVirtualAddress() };
@@ -1846,10 +1938,9 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
-                let Some(index) = host.dynamic(1) else {
+                let Some(index) = self.slots(key.0, host, 1) else {
                     return false;
                 };
-                self.dynamic.push((key.0, index, 1));
                 self.root_srv_slots
                     .insert(key, (index, shadow.as_ref().map(|(_, s)| s.clone())));
                 match &shadow {
@@ -3190,6 +3281,7 @@ impl State {
         indexed: &[RootIndexedView],
         half: &[(u8, u32)],
         compute: bool,
+        (spans, staged): (&[(u8, u32, u32)], &mut Vec<(u64, u32)>),
     ) -> Few<(u8, u32), 16> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         let mut fresh: Few<u8, 16> = Few::default();
@@ -3306,6 +3398,20 @@ impl State {
                 .max()
                 .unwrap_or(0)
                 + 1;
+            // With `table_stages`: as many slots as the stage of this draw
+            // that reads furthest into the table needs among those that make
+            // it afresh too: the ones reading a constant view in it, or every
+            // stage where the table reaches past the host heap's slots
+            // (`spans` is empty with the switch off).
+            let n = match spans.iter().find(|s| s.0 == slot) {
+                Some(&(_, with_constants, all)) => {
+                    let past = heap
+                        .index(table)
+                        .is_some_and(|at| u64::from(at) + u64::from(all) > u64::from(host.count()));
+                    n.max(if past { all } else { with_constants })
+                }
+                None => n,
+            };
             let last = table.checked_add(u64::from(n - 1) * 32);
             if n > crate::descriptor::host::DYNAMIC
                 || last.and_then(|handle| heap.index(handle)).is_none()
@@ -3347,10 +3453,25 @@ impl State {
                 }
                 let depth_before = TESTED_DEPTH.get();
                 TESTED_DEPTH.set((depth_before.0, false));
+                // Found in the table an earlier stage of this draw made
+                // ([`table_stages`]): the title's own slots of the texture
+                // views this stage reads are stamped and mirrored as the
+                // making of a table of its own does it (below).
+                let staged_title = staged
+                    .contains(&(table, n))
+                    .then(|| heap.index(table).filter(|at| at + n <= host.count()))
+                    .flatten();
                 for u in entries().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
                         readable(list, u.kind, &view);
+                        if let Some(title) = staged_title
+                            && crate::descriptor::host::is_texture_view(&view)
+                        {
+                            let k = u.table_offset_dwords / 8;
+                            host.texture_slot_tabled(title + k, true);
+                            host.mirror_after(list, title + k, table + u64::from(k) * 32);
+                        }
                     }
                 }
                 for k in selected {
@@ -3381,15 +3502,16 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
-            let Some(first) = host.dynamic(n) else {
+            let Some(first) = self.slots(std::ptr::from_ref(heap) as usize, host, n) else {
                 // No room: the draw must not run with the title's own
                 // offsets (slots never made for it); `bind` drops it.
                 made.push((slot, u32::MAX));
                 continue;
             };
             self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new() });
-            self.dynamic
-                .push((std::ptr::from_ref(heap) as usize, first, n));
+            if !spans.is_empty() {
+                staged.push((table, n));
+            }
             // The title's own slots of this table: what the draw reads of
             // them it brings up to date here, in the dynamic slots.
             let title_first = heap.index(table).filter(|first| first + n <= host.count());
@@ -3969,7 +4091,7 @@ impl State {
             _ => false,
         };
         if !ran {
-            why("prepare failed");
+            why(&format!("prepare failed: {}", p.name));
             return false;
         }
         #[cfg(feature = "diagnostics")]
@@ -4525,6 +4647,29 @@ mod tests {
         assert_eq!(staging_budget_per_frame(Some(20 * GIB)), 384 * MIB);
         assert_eq!(staging_budget_per_frame(Some(24 * GIB)), 384 * MIB);
         assert_eq!(staging_budget_per_frame(Some(32 * GIB)), 384 * MIB);
+    }
+
+    #[test]
+    fn small_tables_are_cut_from_one_block() {
+        let Some(host) = crate::descriptor::host::HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let chunk = super::slot_chunk();
+        let mut s = super::State::default();
+        assert_eq!(s.slots(1, &host, 0), None);
+        let a = s.slots(1, &host, 5).unwrap();
+        if chunk >= 10 {
+            assert_eq!(s.slots(1, &host, 3), Some(a + 5));
+            assert_eq!(s.dynamic, [(1, a, chunk)]);
+            // Another heap's tables get a block of their own.
+            let b = s.slots(2, &host, 1).unwrap();
+            assert_eq!(s.dynamic[1], (2, b, chunk));
+        }
+        // A big table is taken on its own.
+        let big = chunk / 2 + 1;
+        let c = s.slots(1, &host, big).unwrap();
+        assert_eq!(s.dynamic.last(), Some(&(1, c, big)));
+        s.dynamic.clear(); // not registered: nothing to give back
     }
 }
 

@@ -678,6 +678,21 @@ pub(crate) fn unwind_into(context: CONTEXT, low: usize, high: usize, frames: &mu
             context.Rip = unsafe { (rsp as *const u64).read() };
             context.Rsp += 8;
         } else {
+            // A function with a frame register unwinds from it: one off the
+            // stack (a sample in its prologue, before it is set) faults in
+            // the unwinder (n11: a read at -8 from a sampled title thread).
+            // SAFETY: `entry` and its UNWIND_INFO belong to the loaded `image`;
+            // byte 3's low nibble is the frame register (0: none).
+            let register = unsafe { ((image as usize + (*entry).Anonymous.UnwindInfoAddress as usize + 3) as *const u8).read() } & 0xf;
+            if register != 0 {
+                let r = [
+                    context.Rax, context.Rcx, context.Rdx, context.Rbx, context.Rsp, context.Rbp, context.Rsi, context.Rdi,
+                    context.R8, context.R9, context.R10, context.R11, context.R12, context.R13, context.R14, context.R15,
+                ][register as usize] as usize;
+                if r < low || r > high {
+                    break;
+                }
+            }
             let (mut data, mut frame) = (null_mut(), 0);
             // SAFETY: `entry` belongs to `image`; the context is our copy.
             unsafe {

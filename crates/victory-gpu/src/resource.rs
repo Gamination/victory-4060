@@ -1569,6 +1569,17 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                 .and_then(|(t, host)| crate::tiles::Tiled::make(&host.device, t, u32::from(r.desc.mip_levels)));
             // (Both or neither: a reserved texture the card will not cut
             // into tiles is dropped here, and the old kind is made below.)
+            // LOCAL (n22): of the textures that would be tiled, how many are:
+            // asked (partly mapped), reserved made, cut into tiles.
+            if partly {
+                static N: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+                let asked = N[0].fetch_add(1, Relaxed) + 1;
+                N[1].fetch_add(u64::from(reserved.is_some()), Relaxed);
+                N[2].fetch_add(u64::from(cut.is_some()), Relaxed);
+                if asked.is_power_of_two() {
+                    tracing::warn!(asked, reserved = N[1].load(Relaxed), cut = N[2].load(Relaxed), "LOCAL tiled textures");
+                }
+            }
             if cut.is_some() {
                 tiled = cut;
                 texture = reserved;
@@ -2472,8 +2483,12 @@ fn host_texture_as(
     };
     // A texture the title fills, whose every subresource is uploaded before
     // anything reads it: cut from a block (what the piece held before shows
-    // in no texel).
-    if fills(desc)
+    // in no texel). LOCAL (Neox, via cool_fox c3): not a reserved one,
+    // which must stay without memory of its own for `crate::tiles` to map
+    // its tiles; a placed texture from the block made `Tiled::make` fail,
+    // and the old kind was made beside it.
+    if !reserved
+        && fills(desc)
         && d.sample_count <= 1
         && clear_value.is_none()
         && texture_layout(desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor())

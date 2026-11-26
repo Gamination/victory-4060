@@ -490,6 +490,17 @@ fn window_mapped_most() -> u64 {
     })
 }
 
+/// How much of the card's budget may be in use with a window on the card
+/// (`VICTORY_WINDOWS_ROOM_PERCENT`, 50 to 100; 80, a fifth kept free, by
+/// default). On an 8 GB card the textures fill past 80%, so no window went
+/// there at all.
+fn window_room_percent() -> u64 {
+    static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *PERCENT.get_or_init(|| {
+        std::env::var("VICTORY_WINDOWS_ROOM_PERCENT").ok().and_then(|v| v.trim().parse::<u64>().ok()).map_or(80, |p| p.clamp(50, 100))
+    })
+}
+
 /// Bytes alive of windows in card memory the CPU maps.
 static WINDOW_MAPPED_BYTES: AtomicU64 = AtomicU64::new(0);
 
@@ -502,7 +513,7 @@ fn window_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
     }
     let host = host()?;
     if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
+        && used + size > budget / 100 * window_room_percent()
     {
         return None;
     }
@@ -538,7 +549,7 @@ fn window_room_for(size: u64) -> Option<ID3D12Resource> {
         return None;
     }
     if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
+        && used + size > budget / 100 * window_room_percent()
     {
         return None;
     }

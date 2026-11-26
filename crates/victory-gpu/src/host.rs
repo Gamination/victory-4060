@@ -4910,7 +4910,9 @@ impl Host {
                     if let Some(own) = flight.own {
                         own.landed();
                     }
-                    landed.push((flight.lists, flight.order));
+                    let mut lists = flight.lists;
+                    crate::list::slots_done(&mut lists);
+                    landed.push((lists, flight.order));
                     crate::land::spent(crate::land::stat::READ_BACKS, telling)
                 }
                 Late::Write(at, what, bytes) => {
@@ -5377,7 +5379,9 @@ impl Host {
                         if let Some(card) = flight.card {
                             self.card_done(card);
                         }
-                        landed.push((flight.lists, flight.order));
+                        let mut lists = flight.lists;
+                        crate::list::slots_done(&mut lists);
+                        landed.push((lists, flight.order));
                     }
                     Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
                     Late::Signal(fence, value) => crate::fence::set(fence as crate::object::This, value),
@@ -8802,7 +8806,7 @@ impl Meter {
                 );
                 traffic::line(self.copy_stats_frames as f64);
                 crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
-                for (why, n) in drops.iter().take(40) {
+                for (why, n) in drops.iter().take(80) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",
                         *n as f64 / frames

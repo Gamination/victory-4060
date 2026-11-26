@@ -28,7 +28,13 @@ pub(crate) fn listed(n: u64) -> bool {
                 .collect()
         })
         .contains(&n)
-        || n == KEY_FRAME.load(std::sync::atomic::Ordering::Relaxed);
+        // LOCAL (n21): F9 takes two frames, since the title records the
+        // next frame's first lists before it presents (n20's dumps each
+        // held only one part of a frame).
+        || {
+            let key = KEY_FRAME.load(std::sync::atomic::Ordering::Relaxed);
+            key != u64::MAX && n.wrapping_sub(key) < 2
+        };
     // `VICTORY_CAPTURE_WORLD`: also the 2nd and the 6th frame after the first
     // one that ran 500 draws or more (a title's first 3D frames: their
     // numbers depend on how long the menus were shown), and the 30th and
@@ -136,11 +142,14 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
     if folder().is_some() {
         static WAS_DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         // SAFETY: a plain query of the keyboard's state.
-        let down = unsafe {
+        let state = unsafe {
             windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(i32::from(
                 windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_F9,
             ))
-        } < 0;
+        };
+        // LOCAL: held now, or pressed since the last ask (bit 0): one ask a
+        // present missed taps between slow frames (n19, 0.3 fps).
+        let down = state < 0 || state & 1 != 0;
         if down && !WAS_DOWN.swap(true, Relaxed) {
             KEY_FRAME.store(frame + 1, Relaxed);
             tracing::info!(frame = frame + 1, "F9: this frame is captured");
@@ -652,7 +661,23 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
     // lamp on black have the same highest value.
     let above = values.iter().filter(|v| v.iter().any(|c| c.is_finite() && *c > low)).count();
     let nonzero_percent = above as f32 * 100.0 / values.len().max(1) as f32;
-    tracing::info!(format, low, high, nonzero_percent, "target values");
+    // LOCAL (n23): NaN/inf texels, which the range above leaves out.
+    let nan = values.iter().filter(|v| v.iter().any(|c| c.is_nan())).count();
+    let inf = values.iter().filter(|v| v.iter().any(|c| c.is_infinite())).count();
+    tracing::info!(format, low, high, nonzero_percent, nan, inf, "target values");
+    // LOCAL (n21, ghosting): two-channel half targets (screen motion) as
+    // numbers along a row near the top (sky in an outdoor view) and the
+    // middle: the picture clips negatives to black, so a still sky and a
+    // sky moving left look alike.
+    if matches!(format, 33..=34) && w >= 8 && h >= 8 {
+        for y in [h / 20, h / 2] {
+            let row: Vec<[f32; 2]> = (1..8).map(|k| {
+                let v = decode(px(w * k / 8, y, n));
+                [v[0], v[1]]
+            }).collect();
+            tracing::info!(format, y, ?row, "two-channel half texels at x = w/8..7w/8");
+        }
+    }
     // Small float colour targets (the 1x1 luminance and exposure targets):
     // every texel's four channels as numbers. The picture has no alpha and
     // eight bits a channel.
