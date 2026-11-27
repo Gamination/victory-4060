@@ -1,5 +1,42 @@
 # VIctory for NVIDIA and AMD
 
+## Combined Windows build
+
+This build includes Texture Streaming 02, native FSR 3.1.6 upscaling, shader
+precompilation and a separate log for every launch.
+
+Extract the Windows ZIP and open PowerShell in the folder. To use native FSR,
+install the two AMD runtime files once with Python 3.11 or newer. The installer
+checks both SHA-256 hashes before installing them.
+
+```powershell
+python .\scripts\install-pc-ffx.py --download
+```
+
+| Profile | Texture streaming | Texture streaming with native FSR 3 |
+| --- | --- | --- |
+| AMD Radeon | Double-click `run-amd.bat` | `.\run-amd.bat fsr3` |
+| NVIDIA | `.\run.bat streaming` | `.\run.bat streaming fsr3` |
+
+Select your own game's executable when prompted. Use `.\run.bat amd` or
+`.\run.bat` for the earlier presets. Streaming can skip unchanged texture
+uploads. On cards with Direct3D tiled resources tier 2 or higher, the launcher
+enables on-demand allocation for eligible textures of at least 1 MiB.
+
+Native FSR uses the Series S profile at the game's selected resolution.
+This feature provides temporal upscaling. On systems with multiple cards,
+the PowerShell launchers accept `-Adapter` followed by the card name,
+for example `-Adapter 'RX 7600'`. Both also accept `-TextureStreaming`,
+`-NativeFSR3` and `-FfxDir`.
+
+Logs are in `%LOCALAPPDATA%\victory\logs`. The message
+`PC FFX native game dispatch fence completed` confirms a game frame used
+the native upscaler. A Radeon RX 7600 passed a synthetic 640×360 to 1280×720
+upscale and a shader cache save/restore. Gameplay performance and image quality
+for this merge still need measurement.
+
+## Earlier fork
+
 This fork adds dedicated GPU memory fixes to VIctory for NVIDIA and AMD.
 The memory changes were checked on an AMD Radeon RX 7600, including texture
 uploads and GPU readback, and on Windows' software renderer. Gameplay FPS and
@@ -340,6 +377,14 @@ scripts\play.ps1 -Exe <path of your copy's executable> -More @{VICTORY_TEXTURE_B
 The AMD launcher uses its own profile and settings. The resolution wrappers
 below call the NVIDIA launcher and apply its settings.
 
+### Run logs
+
+Each launch through `run.bat`, the AMD or NVIDIA PowerShell launcher, or a
+resolution shortcut writes a new UTF-8 log to `%LOCALAPPDATA%\victory\logs`.
+The launcher prints its path at startup. Each log includes console output
+from precompilation and gameplay as it arrives, plus the exit code when the
+launcher finishes.
+
 ### Precompiling shaders and pipelines
 
 The first time a place is seen, its shaders are translated and its host
@@ -377,8 +422,8 @@ Two things to know:
 
 The translations are on disk from the moment they are made, in
 `<cache folder>\shaders` (the report names the cache folder). To keep them as
-one file — for a cache that is wiped, or a second machine with the same build
-and settings — `--save` writes every one of them and `--load` puts them back:
+one file â€” for a cache that is wiped, or a second machine with the same build
+and settings â€” `--save` writes every one of them and `--load` puts them back:
 
 ```powershell
 victory precompile --save=<file>   # --save alone uses precompiled.vpc, beside the cache folder
@@ -529,3 +574,9 @@ commits taken from elsewhere name the commit and its author.
 
 GPL-3.0-or-later, as VIctory. See [LICENSE](LICENSE); the one file that is not
 covered is named in [docs/asset-policy.md](docs/asset-policy.md).
+
+---
+
+## Local experimental NVIDIA Native FidelityFX 01 port
+
+See [the integration notes and launch instructions](docs/nvidia-native-fidelityfx-01.md) for the opt-in PC FSR 3.1.6 bridge and cache/streaming improvements. The original NVIDIA launcher behavior is retained when `-NativeFSR3` is not requested. This new integration is not yet Windows/GPU tested; the measurements above refer to the supplied upstream fork.

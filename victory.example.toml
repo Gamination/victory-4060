@@ -25,6 +25,12 @@ test_titles = []
 # env: VICTORY_LOW_RAM
 # low_ram = false
 
+# Allow GPU-upload heaps for eligible card buffers when the driver supports them.
+# VICTORY_CARD_BAR and VICTORY_READBACK_BAR override these values.
+card_bar = true
+# Allow CPU mapping of eligible shader-writable card buffers.
+readback_bar = true
+
 # Arena size in MiB for title memory outside buffers.
 # Default: 64 MiB (32 MiB when low_ram is enabled).
 # env: VICTORY_ARENA_MB

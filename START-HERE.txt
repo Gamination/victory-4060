@@ -1,0 +1,25 @@
+VIctory Combined for Windows x64
+
+Extract the entire ZIP. Open PowerShell in the extracted folder. Choose the
+command for your card, then select your own game's executable when prompted.
+
+    Double-click run-amd.bat    Radeon with texture streaming
+    .\run.bat streaming         NVIDIA with texture streaming
+
+To enable native FSR 3.1.6 upscaling, install the AMD runtime files once
+with Python 3.11 or newer.
+
+    python .\scripts\install-pc-ffx.py --download
+
+Then run the command for your card.
+
+    .\run-amd.bat fsr3
+    .\run.bat streaming fsr3
+
+Use .\run.bat amd or .\run.bat for the earlier presets. Native FSR uses
+Series S and lets the game select the render resolution. Both launchers
+precompile shaders and reuse the cache on later runs. Keep game files,
+caches and saves outside this folder.
+
+Each launch writes a separate log in %LOCALAPPDATA%\victory\logs.
+See README.md for additional options, test results and project credits.

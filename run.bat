@@ -1,10 +1,13 @@
 @echo off
 setlocal EnableExtensions DisableDelayedExpansion
 rem ===========================================================================
-rem  run.bat - starts the title on an NVIDIA card.
+rem  run.bat - starts the title using the NVIDIA or Radeon profile.
 rem
 rem    run.bat              Series S, rendering at 540p (what this fork is
 rem                         measured with: about 20 fps on a 4060)
+rem    run.bat amd          use the Radeon launcher
+rem    run.bat amd streaming fsr3     Radeon streaming and native FSR 3 upscaling
+rem    run.bat streaming fsr3         equivalent options on the NVIDIA profile
 rem    run.bat 720p         render at 720p instead (480p, 540p, 1080p, 1440p,
 rem                         2160p also accepted)
 rem    run.bat quality      fewer stretched bodies and less rainbow skin,
@@ -35,21 +38,28 @@ rem  cancelled, paste the path into this window or drag the file into it. The
 rem  path is kept in %LOCALAPPDATA%\victory\game-path.txt and used from then
 rem  on: change the dump, or move it, and the next run asks again by itself.
 rem  These combine:  run.bat precompile quality 720p
-rem  It only wraps scripts\play-nvidia.ps1, the fork's own launcher, so the
-rem  settings stay exactly the ones it measured. Set VICTORY_NO_PAUSE=1 to
+rem  Set VICTORY_NO_PAUSE=1 to
 rem  skip the wait, VICTORY_DRY_RUN=1 to only print what would start.
 rem ===========================================================================
 cd /d "%~dp0"
 
 set "BUILD=diag"
+set "PROFILE=nvidia"
+set "STREAMING="
+set "NVONLY="
 set "ARGS="
 set "CHOOSE="
 
 :args
 if "%~1"=="" goto :args_done
-if /i "%~1"=="quality"  ( set "ARGS=%ARGS% -Quality"  & shift & goto :args )
+if /i "%~1"=="bar" ( set "VICTORY_CARD_BAR=1" & set "VICTORY_READBACK_BAR=1" & shift & goto :args )
+if /i "%~1"=="nobar" ( set "VICTORY_CARD_BAR=0" & set "VICTORY_READBACK_BAR=0" & shift & goto :args )
+if /i "%~1"=="amd" ( set "PROFILE=amd" & shift & goto :args )
+if /i "%~1"=="streaming" ( set "STREAMING=1" & shift & goto :args )
+if /i "%~1"=="fsr3" ( set "ARGS=%ARGS% -NativeFSR3" & shift & goto :args )
+if /i "%~1"=="quality"  ( set "NVONLY=%~1" & set "ARGS=%ARGS% -Quality"  & shift & goto :args )
 if /i "%~1"=="rt"       ( set "ARGS=%ARGS% -RayTracing" & shift & goto :args )
-if /i "%~1"=="seriesx"  ( set "ARGS=%ARGS% -SeriesX"  & shift & goto :args )
+if /i "%~1"=="seriesx"  ( set "NVONLY=%~1" & set "ARGS=%ARGS% -SeriesX"  & shift & goto :args )
 if /i "%~1"=="seriess"  ( shift & goto :args )
 if /i "%~1"=="release"  ( set "BUILD=release" & shift & goto :args )
 if /i "%~1"=="diag"     ( set "BUILD=diag" & shift & goto :args )
@@ -58,16 +68,21 @@ if /i "%~1"=="skip"     ( set "ARGS=%ARGS% -NoPrecompile" & shift & goto :args )
 if /i "%~1"=="save"     ( set "ARGS=%ARGS% -SaveShaders" & shift & goto :args )
 if /i "%~1"=="load"     ( set "ARGS=%ARGS% -LoadShaders" & shift & goto :args )
 if /i "%~1"=="path"     ( set "CHOOSE=1" & shift & goto :args )
-if /i "%~1"=="480p"     ( set "ARGS=%ARGS% -Resolution 480"  & shift & goto :args )
-if /i "%~1"=="540p"     ( set "ARGS=%ARGS% -Resolution 540"  & shift & goto :args )
-if /i "%~1"=="720p"     ( set "ARGS=%ARGS% -Resolution 720"  & shift & goto :args )
-if /i "%~1"=="1080p"    ( set "ARGS=%ARGS% -Resolution 1080" & shift & goto :args )
-if /i "%~1"=="1440p"    ( set "ARGS=%ARGS% -Resolution 1440" & shift & goto :args )
-if /i "%~1"=="2160p"    ( set "ARGS=%ARGS% -Resolution 2160" & shift & goto :args )
+if /i "%~1"=="480p"     ( set "NVONLY=%~1" & set "ARGS=%ARGS% -Resolution 480"  & shift & goto :args )
+if /i "%~1"=="540p"     ( set "NVONLY=%~1" & set "ARGS=%ARGS% -Resolution 540"  & shift & goto :args )
+if /i "%~1"=="720p"     ( set "NVONLY=%~1" & set "ARGS=%ARGS% -Resolution 720"  & shift & goto :args )
+if /i "%~1"=="1080p"    ( set "NVONLY=%~1" & set "ARGS=%ARGS% -Resolution 1080" & shift & goto :args )
+if /i "%~1"=="1440p"    ( set "NVONLY=%~1" & set "ARGS=%ARGS% -Resolution 1440" & shift & goto :args )
+if /i "%~1"=="2160p"    ( set "NVONLY=%~1" & set "ARGS=%ARGS% -Resolution 2160" & shift & goto :args )
 echo Unknown option "%~1".
-echo Options: path, precompile, skip, save, load, quality, rt, seriesx, release, diag, 480p, 540p, 720p, 1080p, 1440p, 2160p
+echo Options: bar, nobar, amd, streaming, fsr3, path, precompile, skip, save, load, quality, rt, seriesx, release, diag, 480p, 540p, 720p, 1080p, 1440p, 2160p
 exit /b 2
 :args_done
+if defined STREAMING set "ARGS=%ARGS% -TextureStreaming"
+if "%PROFILE%"=="amd" if defined NVONLY (
+  echo Option "%NVONLY%" requires the NVIDIA profile.
+  exit /b 2
+)
 
 rem The path of the title: asked for once, kept between runs.
 set "GAME_FILE=%LOCALAPPDATA%\victory\game-path.txt"
@@ -79,6 +94,7 @@ if not defined GAME_EXE if not defined VICTORY_DRY_RUN call :choose
 
 set "RUNNER=%CD%\target\%BUILD%\victory.exe"
 set "LAUNCHER=%CD%\scripts\play-nvidia.ps1"
+if "%PROFILE%"=="amd" set "LAUNCHER=%CD%\scripts\play.ps1"
 
 if defined VICTORY_DRY_RUN (
   echo [dry run] powershell -NoProfile -ExecutionPolicy Bypass -File "%LAUNCHER%" -Exe "%GAME_EXE%" -Build %BUILD%%ARGS%
@@ -90,19 +106,6 @@ if not exist "%LAUNCHER%" (
   set "CODE=2"
   goto :stop
 )
-if not exist "%RUNNER%" (
-  echo No "%RUNNER%".
-  echo Build it first:  build.bat %BUILD%
-  set "CODE=2"
-  goto :stop
-)
-if not exist "%GAME_EXE%" (
-  echo No "%GAME_EXE%".
-  echo Run "run.bat path" to choose the title's .exe again.
-  set "CODE=2"
-  goto :stop
-)
-
 echo victory : "%RUNNER%"  ^(%BUILD%^)
 echo title   : "%GAME_EXE%"
 echo.
